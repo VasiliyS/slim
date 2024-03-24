@@ -890,12 +890,13 @@ const (
 	ArchEmpty = ""
 	ArchAmd64 = "amd64"
 	ArchArm64 = "arm64"
+	ArchS390x = "s390x"
 )
 
 func getImageBuildArch(ctx *cli.Context) (string, error) {
 	value := ctx.String(FlagImageBuildArch)
 	switch value {
-	case ArchEmpty, ArchAmd64, ArchArm64:
+	case ArchEmpty, ArchAmd64, ArchArm64, ArchS390x:
 		return value, nil
 	default:
 		return "", fmt.Errorf("bad value")

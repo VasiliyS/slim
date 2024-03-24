@@ -10,7 +10,7 @@ BUILD_TIME="$(date -u '+%Y-%m-%d_%I:%M:%S%p')"
 TAG="current"
 REVISION="current"
 if hash git 2>/dev/null && [ -e $BDIR/.git ]; then
-  TAG="$(git describe --tags)"
+  TAG="$(git describe --tags --always)"
   REVISION="$(git rev-parse HEAD)"
 fi
 
@@ -22,5 +22,7 @@ BINDIR="${BDIR}/bin"
 mkdir -p "$BINDIR"
 rm -rf "${BINDIR}/"*
 
+: "${TARGET_ARCH:=amd64}"
+
 CGO_ENABLED=0 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim" "${BDIR}/cmd/slim/main.go"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"
+CGO_ENABLED=0 GOOS=linux GOARCH=$TARGET_ARCH go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"

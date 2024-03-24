@@ -24,6 +24,8 @@ func CallNumberResolver(arch ArchName) NumberResolverFunc {
 		return callNameArmFamily32
 	case ArchNameArm64:
 		return callNameArmFamily64
+	case ArchNameS390x:
+		return callNameS390x
 	default:
 		return nil
 	}
@@ -39,6 +41,8 @@ func CallNameResolver(arch ArchName) NameResolverFunc {
 		return callNumberArmFamily32
 	case ArchNameArm64:
 		return callNumberArmFamily64
+	case ArchNameS390x:
+		return callNumberS390x
 	default:
 		return nil
 	}
