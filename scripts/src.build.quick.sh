@@ -22,7 +22,6 @@ BINDIR="${BDIR}/bin"
 mkdir -p "$BINDIR"
 rm -rf "${BINDIR}/"*
 
-: "${TARGET_ARCH:=amd64}"
 
 CGO_ENABLED=0 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim" "${BDIR}/cmd/slim/main.go"
-CGO_ENABLED=0 GOOS=linux GOARCH=$TARGET_ARCH go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"
+CGO_ENABLED=0 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"

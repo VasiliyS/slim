@@ -228,6 +228,7 @@ func (m *monitor) Start() error {
 			// Probably, the fanotify events should be read as quick as just possible.
 			path, err := os.Readlink(fmt.Sprintf(procFsFdInfo, data.File.Fd()))
 			if err != nil {
+				logger.Debugf("fanotify.ev: %v", data)
 				m.errorCh <- errors.SE("sensor.fanotify.Run/os.Readlink", "call.error", err)
 				continue
 			}
