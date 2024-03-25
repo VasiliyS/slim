@@ -65,7 +65,7 @@ func (ref *Engine) Build(options imagebuilder.SimpleBuildOptions) (*imagebuilder
 	switch options.ImageConfig.Architecture {
 	case "":
 		options.ImageConfig.Architecture = "amd64"
-	case "arm64", "amd64":
+	case "arm64", "amd64", "s390x":
 	default:
 		return nil, fmt.Errorf("bad architecture value")
 	}
