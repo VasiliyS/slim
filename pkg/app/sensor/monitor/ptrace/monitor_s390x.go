@@ -221,14 +221,14 @@ func (m *monitor) Start() error {
 			var callNum uint64
 			var retVal uint64
 			for wstat.Stopped() {
-				var regs unix.PtraceRegsArm64
+				var regs unix.PtraceRegs
 
 				switch syscallReturn {
 				case false:
 					logger.Infof("target pid is %d", targetPid)
-					if err := unix.PtraceGetRegSetArm64(targetPid, 1, &regs); err != nil {
+					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
 						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
-						logger.Fatalf("unix.PtraceGetRegsArm64(call): %v", err)
+						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
 					}
 
 					callNum = system.CallNumber(regs)
@@ -236,9 +236,9 @@ func (m *monitor) Start() error {
 					gotCallNum = true
 
 				case true:
-					if err := unix.PtraceGetRegSetArm64(targetPid, 1, &regs); err != nil {
+					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
 						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
-						logger.Fatalf("unix.PtraceGetRegsArm64(return): %v", err)
+						logger.Fatalf("unix.PtraceGetRegs(return): %v", err)
 					}
 
 					retVal = system.CallReturnValue(regs)
@@ -248,6 +248,7 @@ func (m *monitor) Start() error {
 				}
 
 				//err = syscall.PtraceSyscall(pid, 0)
+				// continue execution
 				err = unix.PtraceSyscall(targetPid, 0)
 				if err != nil {
 					logger.Warnf("unix.PtraceSyscall error: %v", err)

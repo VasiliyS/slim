@@ -31,10 +31,6 @@ const (
 	PROC_EVENT_ALL = PROC_EVENT_FORK | PROC_EVENT_EXEC | PROC_EVENT_EXIT
 )
 
-var (
-	byteOrder = binary.LittleEndian
-)
-
 // linux/connector.h: struct cb_id
 type cbId struct {
 	Idx uint32

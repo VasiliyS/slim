@@ -1,3 +1,5 @@
+//go:build linux
+
 package controlled_test
 
 import (

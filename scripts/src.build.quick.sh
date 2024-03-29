@@ -24,4 +24,4 @@ rm -rf "${BINDIR}/"*
 
 
 CGO_ENABLED=0 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim" "${BDIR}/cmd/slim/main.go"
-CGO_ENABLED=0 go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"
+CGO_ENABLED=0 GOOS=linux go build -ldflags="${LD_FLAGS}" -mod=vendor -o "${BINDIR}/slim-sensor" "${BDIR}/cmd/slim-sensor/main.go"

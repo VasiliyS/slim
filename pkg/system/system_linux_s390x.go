@@ -1,12 +1,12 @@
 package system
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 )
 
 /*
 S390X SYSCALL REGISTER USE:
-source: https://github.molgen.mpg.de/git-mirror/glibc/blob/c0da14cdda1fa552262ce3624156194eef43e973/sysdeps/unix/sysv/linux/s390/s390-64/syscall.S#L45
+source: https://github.molgen.mpg.de/git-mirror/glibc/blob/c0da14cdda1fa552262ce3624156194eef43e973/sysdeps/unix/sysv/linux/s390/s390-64/unix.S#L45
 
 Syscall Number:   r2
 Return Value:     r2
@@ -27,26 +27,26 @@ func LookupCallNumber(name string) (uint32, bool) {
 	return callNumberS390x(name)
 }
 
-func CallNumber(regs syscall.PtraceRegs) uint64 {
+func CallNumber(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[2]
 }
 
-func CallReturnValue(regs syscall.PtraceRegs) uint64 {
+func CallReturnValue(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[2]
 }
 
-func CallFirstParam(regs syscall.PtraceRegs) uint64 {
+func CallFirstParam(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[3]
 }
 
-func CallSecondParam(regs syscall.PtraceRegs) uint64 {
+func CallSecondParam(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[4]
 }
 
-func CallThirdParam(regs syscall.PtraceRegs) uint64 {
+func CallThirdParam(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[5]
 }
 
-func CallFourthParam(regs syscall.PtraceRegs) uint64 {
+func CallFourthParam(regs unix.PtraceRegs) uint64 {
 	return regs.Gprs[6]
 }

@@ -272,7 +272,6 @@ func (ref *Execution) Start() error {
 				ref.ContainerName, ref.ContainerID)
 		}
 	}
-
 	if ref.eventCh != nil {
 		ref.eventCh <- &ExecutionEvenInfo{
 			Event: XECreated,
@@ -335,11 +334,10 @@ func (ref *Execution) Start() error {
 			ovars{
 				"status": "started",
 				"name":   containerInfo.Name,
-				"id":     ref.ContainerID,
 			})
 
 		if ref.logger != nil {
-			ref.logger.Tracef("container started = name=%s id=%s\n",
+			ref.logger.Tracef("container started = name=%s id=%s \n",
 				ref.ContainerName, ref.ContainerID)
 		}
 	}
@@ -397,17 +395,24 @@ func (ref *Execution) Stop() error {
 
 // Cleanup removes stopped container for the execution
 func (ref *Execution) Cleanup() error {
-	removeOption := dockerapi.RemoveContainerOptions{
-		ID:            ref.ContainerID,
-		RemoveVolumes: true,
-		Force:         true,
-	}
-
-	err := ref.APIClient.RemoveContainer(removeOption)
-	if err != nil {
-		if ref.logger != nil {
-			ref.logger.Info("error removing container =>", err)
+	/*
+		removeOption := dockerapi.RemoveContainerOptions{
+			ID:            ref.ContainerID,
+			RemoveVolumes: true,
+			Force:         true,
 		}
+
+
+			err := ref.APIClient.RemoveContainer(removeOption)
+			if err != nil {
+				if ref.logger != nil {
+					ref.logger.Info("error removing container =>", err)
+				}
+			}
+	*/
+
+	if ref.logger != nil {
+		ref.logger.Debug("container not removed!")
 	}
 
 	ref.State = XSRemoved
@@ -417,7 +422,8 @@ func (ref *Execution) Cleanup() error {
 		}
 	}
 
-	return err
+	//return err
+	return nil
 }
 
 // Wait waits the container execution

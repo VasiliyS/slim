@@ -646,6 +646,7 @@ func (i *Inspector) RunContainer() error {
 				"status": "created",
 				"name":   containerInfo.Name,
 				"id":     i.ContainerID,
+				"image":  containerInfo.Image,
 			})
 	}
 
@@ -1186,17 +1187,19 @@ func (i *Inspector) ShutdownContainer(terminateOnly bool) error {
 		} else {
 			errutil.WarnOn(err)
 		}
+		/*
+			removeOption := dockerapi.RemoveContainerOptions{
+				ID:            i.ContainerID,
+				RemoveVolumes: true,
+				Force:         true,
+			}
 
-		removeOption := dockerapi.RemoveContainerOptions{
-			ID:            i.ContainerID,
-			RemoveVolumes: true,
-			Force:         true,
-		}
-
-		if err := i.APIClient.RemoveContainer(removeOption); err != nil {
-			logger.Infof("error removing container ('%v')... terminating container", err)
-			_ = i.APIClient.KillContainer(dockerapi.KillContainerOptions{ID: i.ContainerID})
-		}
+			if err := i.APIClient.RemoveContainer(removeOption); err != nil {
+				logger.Infof("error removing container ('%v')... terminating container", err)
+				_ = i.APIClient.KillContainer(dockerapi.KillContainerOptions{ID: i.ContainerID})
+			}
+		*/
+		logger.Debugf("container=%s is not removed!", i.ContainerName)
 	}()
 
 	if !terminateOnly {
