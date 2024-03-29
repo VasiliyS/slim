@@ -28,20 +28,15 @@ type syscallEvent struct {
 
 const (
 	eventBufSize = 500
-	ptOptions    = unix.PTRACE_O_TRACECLONE | unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK
+	ptOptions    = unix.PTRACE_O_TRACECLONE |
+		unix.PTRACE_O_TRACEFORK |
+		unix.PTRACE_O_TRACEVFORK |
+		unix.PTRACE_O_TRACESYSGOOD |
+		unix.PTRACE_O_TRACEEXIT |
+		unix.PTRACE_O_EXITKILL
+
+	traceSysGoodStatusBit = 0x80
 )
-
-/*
-	unix.PTRACE_O_EXITKILL|
-	unix.PTRACE_O_TRACESECCOMP|
-	syscall.PTRACE_O_TRACESYSGOOD|
-	syscall.PTRACE_O_TRACEEXEC|
-	syscall.PTRACE_O_TRACECLONE|
-	syscall.PTRACE_O_TRACEFORK|
-	syscall.PTRACE_O_TRACEVFORK
-
-	syscall.PTRACE_O_TRACECLONE|syscall.PTRACE_O_TRACEEXIT
-*/
 
 type status struct {
 	report *report.PtMonitorReport
@@ -194,12 +189,12 @@ func (m *monitor) Start() error {
 				return
 			}
 
-			//err = syscall.PtraceSetOptions(targetPid, ptOptions)
-			//if err != nil {
-			//	log.Warnf("ptmon: collector - error setting trace options %d: %v", targetPid, err)
-			//	collectorDoneChan <- 3
-			//	return
-			//}
+			err = syscall.PtraceSetOptions(targetPid, ptOptions)
+			if err != nil {
+				log.Warnf("ptmon: collector - error setting trace options %d: %v", targetPid, err)
+				collectorDoneChan <- 3
+				return
+			}
 
 			logger.Debugf("initial process status = %v (pid=%d)\n", wstat, pid)
 
@@ -223,23 +218,24 @@ func (m *monitor) Start() error {
 			for wstat.Stopped() {
 				var regs unix.PtraceRegs
 
+				if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
+					//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
+					logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
+				}
+
+				stopSig := wstat.StopSignal()
+				logger.Tracef("stopSig=%d (%s), traceSysGoodStatusBit=%v", int(stopSig), stopSig.String(), int(syscall.SIGTRAP|traceSysGoodStatusBit) == int(stopSig))
+
 				switch syscallReturn {
 				case false:
-					logger.Infof("target pid is %d", targetPid)
-					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
-						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
-						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
-					}
+					logger.Tracef("before syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
 					callNum = system.CallNumber(regs)
 					syscallReturn = true
 					gotCallNum = true
 
 				case true:
-					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
-						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
-						logger.Fatalf("unix.PtraceGetRegs(return): %v", err)
-					}
+					logger.Tracef("after syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
 					retVal = system.CallReturnValue(regs)
 					syscallReturn = false

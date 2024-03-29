@@ -28,7 +28,7 @@ func LookupCallNumber(name string) (uint32, bool) {
 }
 
 func CallNumber(regs unix.PtraceRegs) uint64 {
-	return regs.Gprs[2]
+	return regs.Orig_gpr2
 }
 
 func CallReturnValue(regs unix.PtraceRegs) uint64 {
