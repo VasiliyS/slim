@@ -30,9 +30,9 @@ const (
 	eventBufSize = 500
 	ptOptions    = unix.PTRACE_O_TRACESYSGOOD | // flag syscall-stops with SIGTRAP|0x80 signal
 		unix.PTRACE_O_EXITKILL |
-		unix.PTRACE_O_TRACECLONE |
-		unix.PTRACE_O_TRACEFORK |
-		unix.PTRACE_O_TRACEVFORK |
+		//	unix.PTRACE_O_TRACECLONE |
+		//	unix.PTRACE_O_TRACEFORK |
+		//	unix.PTRACE_O_TRACEVFORK |
 		unix.PTRACE_O_TRACEEXIT
 
 	traceSysGoodStatusBit = 0x80
