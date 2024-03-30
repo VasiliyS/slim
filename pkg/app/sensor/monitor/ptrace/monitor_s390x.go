@@ -28,12 +28,12 @@ type syscallEvent struct {
 
 const (
 	eventBufSize = 500
-	ptOptions    = unix.PTRACE_O_TRACECLONE |
+	ptOptions    = unix.PTRACE_O_TRACESYSGOOD | // flag syscall-stops with SIGTRAP|0x80 signal
+		unix.PTRACE_O_EXITKILL |
+		unix.PTRACE_O_TRACECLONE |
 		unix.PTRACE_O_TRACEFORK |
 		unix.PTRACE_O_TRACEVFORK |
-		unix.PTRACE_O_TRACESYSGOOD |
-		unix.PTRACE_O_TRACEEXIT |
-		unix.PTRACE_O_EXITKILL
+		unix.PTRACE_O_TRACEEXIT
 
 	traceSysGoodStatusBit = 0x80
 )
@@ -188,6 +188,9 @@ func (m *monitor) Start() error {
 				collectorDoneChan <- 2
 				return
 			}
+			if pid != targetPid {
+				logger.Tracef("wait4 returned new pid(%d), expected(%d)", pid, targetPid)
+			}
 
 			err = syscall.PtraceSetOptions(targetPid, ptOptions)
 			if err != nil {
@@ -196,7 +199,7 @@ func (m *monitor) Start() error {
 				return
 			}
 
-			logger.Debugf("initial process status = %v (pid=%d)\n", wstat, pid)
+			logger.Debugf("initial process status = %v (pid=%d)", wstat, pid)
 
 			if wstat.Exited() {
 				logger.Warn("app exited (unexpected)")
@@ -224,7 +227,50 @@ func (m *monitor) Start() error {
 				}
 
 				stopSig := wstat.StopSignal()
-				logger.Tracef("stopSig=%d (%s), traceSysGoodStatusBit=%v", int(stopSig), stopSig.String(), int(syscall.SIGTRAP|traceSysGoodStatusBit) == int(stopSig))
+
+				var stopType = "syscall_stop"
+				if stopSig != unix.SIGTRAP|traceSysGoodStatusBit {
+
+					switch wstat.TrapCause() {
+					case syscall.PTRACE_EVENT_CLONE,
+						syscall.PTRACE_EVENT_FORK,
+						syscall.PTRACE_EVENT_VFORK,
+						syscall.PTRACE_EVENT_VFORK_DONE,
+						syscall.PTRACE_EVENT_EXEC,
+						syscall.PTRACE_EVENT_EXIT:
+						stopType = "ptrace_event"
+					case syscall.PTRACE_EVENT_SECCOMP:
+						stopType = "seccomp_stop"
+					default:
+						switch stopSig {
+						case syscall.SIGSTOP,
+							syscall.SIGTSTP,
+							syscall.SIGTTIN,
+							syscall.SIGTTOU:
+							stopType = "group_stop"
+						default:
+							stopType = "signal_stop"
+
+						}
+
+					}
+
+				}
+
+				logger.Tracef("stopSig=%d (%s), stop type => %v", int(stopSig), stopSig.String(), stopType)
+				if stopType != "syscall_stop" {
+					logger.Tracef("non syscall stop, returning control to pid (%d)...", pid)
+					var childSig = int(0)
+					if stopType == "signal_stop" {
+						childSig = int(stopSig)
+					}
+					err = unix.PtraceSyscall(pid, childSig)
+					if err != nil {
+						logger.Warnf("unix.PtraceSyscall error: %v", err)
+						break
+					}
+					continue
+				}
 
 				switch syscallReturn {
 				case false:
@@ -256,6 +302,9 @@ func (m *monitor) Start() error {
 				if err != nil {
 					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", targetPid, err)
 					break
+				}
+				if pid != targetPid {
+					logger.Tracef("wait4 returned new pid(%d), expected(%d)", pid, targetPid)
 				}
 
 				if gotCallNum && gotRetVal {
@@ -296,7 +345,7 @@ func (m *monitor) Start() error {
 				break done
 			case e := <-eventChan:
 				ptReport.SyscallCount++
-				logger.Tracef("syscall ==> %d", e.callNum)
+				logger.Tracef("syscall ==> %d (%s)", e.callNum, syscallResolver(e.callNum))
 
 				if _, ok := syscallStats[e.callNum]; ok {
 					syscallStats[e.callNum]++
