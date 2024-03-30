@@ -232,7 +232,7 @@ func (m *monitor) Start() error {
 						syscall.PTRACE_EVENT_VFORK_DONE,
 						syscall.PTRACE_EVENT_EXEC,
 						syscall.PTRACE_EVENT_EXIT:
-						stopType = "ptrace_event"
+						stopType = "ptrace_event_stop"
 					case syscall.PTRACE_EVENT_SECCOMP:
 						stopType = "seccomp_stop"
 					default:
@@ -243,22 +243,24 @@ func (m *monitor) Start() error {
 							syscall.SIGTTOU:
 							stopType = "group_stop"
 						default:
-							stopType = "signal_stop"
+							if stopSig == unix.SIGTRAP {
+								stopType = "ptrace_stop"
 
+							} else {
+								stopType = "signal_stop"
+							}
 						}
-
 					}
-
 				}
 
 				logger.Tracef("stopSig=%d (%s), stop type => %v", int(stopSig), stopSig.String(), stopType)
 				var childSig = int(0)
 				if stopType != "syscall_stop" {
-					logger.Tracef("non syscall stop, returning control to pid (%d)...", pid)
 
 					if stopType == "signal_stop" {
 						childSig = int(stopSig)
 					}
+					logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 				} else {
 					var regs unix.PtraceRegs
 
@@ -295,9 +297,9 @@ func (m *monitor) Start() error {
 				}
 
 				//pid, err = syscall.Wait4(-1, &wstat, syscall.WALL, nil)
-				pid, err = unix.Wait4(targetPid, &wstat, 0, nil)
+				pid, err = unix.Wait4(pid, &wstat, 0, nil)
 				if err != nil {
-					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", targetPid, err)
+					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
 					break
 				}
 				if pid != targetPid {
