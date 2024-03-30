@@ -219,12 +219,6 @@ func (m *monitor) Start() error {
 			var callNum uint64
 			var retVal uint64
 			for wstat.Stopped() {
-				var regs unix.PtraceRegs
-
-				if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
-					//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
-					logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
-				}
 
 				stopSig := wstat.StopSignal()
 
@@ -258,40 +252,43 @@ func (m *monitor) Start() error {
 				}
 
 				logger.Tracef("stopSig=%d (%s), stop type => %v", int(stopSig), stopSig.String(), stopType)
+				var childSig = int(0)
 				if stopType != "syscall_stop" {
 					logger.Tracef("non syscall stop, returning control to pid (%d)...", pid)
-					var childSig = int(0)
+
 					if stopType == "signal_stop" {
 						childSig = int(stopSig)
 					}
-					err = unix.PtraceSyscall(pid, childSig)
-					if err != nil {
-						logger.Warnf("unix.PtraceSyscall error: %v", err)
-						break
+				} else {
+					var regs unix.PtraceRegs
+
+					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
+						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
+						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
 					}
-					continue
-				}
 
-				switch syscallReturn {
-				case false:
-					logger.Tracef("before syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+					switch syscallReturn {
+					case false:
+						logger.Tracef("before syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
-					callNum = system.CallNumber(regs)
-					syscallReturn = true
-					gotCallNum = true
+						callNum = system.CallNumber(regs)
+						syscallReturn = true
+						gotCallNum = true
 
-				case true:
-					logger.Tracef("after syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+					case true:
+						logger.Tracef("after syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
-					retVal = system.CallReturnValue(regs)
-					syscallReturn = false
-					gotRetVal = true
+						retVal = system.CallReturnValue(regs)
+						syscallReturn = false
+						gotRetVal = true
+
+					}
 
 				}
 
 				//err = syscall.PtraceSyscall(pid, 0)
 				// continue execution
-				err = unix.PtraceSyscall(targetPid, 0)
+				err = unix.PtraceSyscall(pid, childSig)
 				if err != nil {
 					logger.Warnf("unix.PtraceSyscall error: %v", err)
 					break
