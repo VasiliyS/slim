@@ -269,8 +269,7 @@ func (m *monitor) Start() error {
 						newChildPID, _ := syscall.PtraceGetEventMsg(targetPid)
 						cause := wstat.TrapCause()
 						logger.Tracef("ptrace stop occured (%s), event pid = %d, continue...", PtraceEvenEnum(cause), newChildPID)
-						syscall.PtraceSyscall(int(newChildPID), 0)
-						continue
+						pid = int(newChildPID)
 					}
 					logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 				} else {
@@ -308,8 +307,8 @@ func (m *monitor) Start() error {
 					break
 				}
 
-				//pid, err = syscall.Wait4(-1, &wstat, syscall.WALL, nil)
-				pid, err = unix.Wait4(pid, &wstat, 0, nil)
+				// wait for any child process to accommodate clones
+				pid, err = unix.Wait4(-1, &wstat, 0, nil)
 				if err != nil {
 					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
 					break
