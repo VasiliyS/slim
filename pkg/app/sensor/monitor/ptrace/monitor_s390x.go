@@ -243,11 +243,9 @@ func (m *monitor) Start() error {
 						syscall.PTRACE_EVENT_EXEC,
 						syscall.PTRACE_EVENT_EXIT:
 						stopType = "ptrace_event_stop"
-						if syscallReturn {
-							// previous syscall (e.g. clone) happened
-							// but will not be ended in a normal cycle
-							syscallReturn = false
-						}
+						// previous syscall (e.g. clone) happened
+						// but will not be ended in a normal cycle
+						syscallReturn = false
 					case syscall.PTRACE_EVENT_SECCOMP:
 						stopType = "seccomp_stop"
 					default:
@@ -264,7 +262,12 @@ func (m *monitor) Start() error {
 					stopType = "signal_stop"
 				}
 
-				logger.Tracef("stopSig=%d (%s), stop type => %v", int(stopSig), stopSig.String(), stopType)
+				logger.Tracef(
+					"stopSig=%d (%s), stop type => %v, syscallReturn(%v)",
+					int(stopSig), stopSig.String(),
+					stopType,
+					syscallReturn)
+
 				var childSig = int(0)
 				if stopType != "syscall_stop" {
 
