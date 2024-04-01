@@ -41,6 +41,7 @@ const (
 		unix.PTRACE_O_TRACEEXIT
 
 	traceSysGoodStatusBit = 0x80
+	SIGPTRAP              = syscall.SIGTRAP | traceSysGoodStatusBit
 )
 
 type status struct {
@@ -225,12 +226,16 @@ func (m *monitor) Start() error {
 			var retVal uint64
 			for wstat.Stopped() {
 
+				var stopType string
 				stopSig := wstat.StopSignal()
 
-				var stopType = "syscall_stop"
-				if stopSig != unix.SIGTRAP|traceSysGoodStatusBit {
+				switch stopSig {
 
-					switch wstat.TrapCause() {
+				case SIGPTRAP:
+					stopType = "syscall_stop"
+
+				case syscall.SIGTRAP:
+					switch trapCause := wstat.TrapCause(); trapCause {
 					case syscall.PTRACE_EVENT_CLONE,
 						syscall.PTRACE_EVENT_FORK,
 						syscall.PTRACE_EVENT_VFORK,
@@ -241,21 +246,16 @@ func (m *monitor) Start() error {
 					case syscall.PTRACE_EVENT_SECCOMP:
 						stopType = "seccomp_stop"
 					default:
-						switch stopSig {
-						case syscall.SIGSTOP,
-							syscall.SIGTSTP,
-							syscall.SIGTTIN,
-							syscall.SIGTTOU:
-							stopType = "group_stop"
-						default:
-							if stopSig == unix.SIGTRAP {
-								stopType = "ptrace_stop"
-
-							} else {
-								stopType = "signal_stop"
-							}
-						}
+						logger.Tracef("unknown ptrace event stop (%d)...", trapCause)
+						stopType = fmt.Sprintf("ptrace_%d_event", trapCause)
 					}
+				case syscall.SIGSTOP,
+					syscall.SIGTSTP,
+					syscall.SIGTTIN,
+					syscall.SIGTTOU:
+					stopType = "group_stop"
+				default:
+					stopType = "signal_stop"
 				}
 
 				logger.Tracef("stopSig=%d (%s), stop type => %v", int(stopSig), stopSig.String(), stopType)
@@ -265,7 +265,7 @@ func (m *monitor) Start() error {
 					if stopType == "signal_stop" {
 						childSig = int(stopSig)
 					}
-					if stopType == "ptrace_stop" {
+					if stopType == "ptrace_event_stop" {
 						newChildPID, _ := syscall.PtraceGetEventMsg(targetPid)
 						cause := wstat.TrapCause()
 						logger.Tracef("ptrace stop occured (%s), event pid = %d, continue...", PtraceEvenEnum(cause), newChildPID)
@@ -459,8 +459,7 @@ var ptEventMap = map[int]string{
 	syscall.PTRACE_EVENT_EXEC:       "PTRACE_EVENT_EXEC",
 	syscall.PTRACE_EVENT_EXIT:       "PTRACE_EVENT_EXIT",
 	syscall.PTRACE_EVENT_FORK:       "PTRACE_EVENT_FORK",
-	unix.PTRACE_EVENT_SECCOMP:       "PTRACE_EVENT_SECCOMP",
-	unix.PTRACE_EVENT_STOP:          "PTRACE_EVENT_STOP",
+	syscall.PTRACE_EVENT_SECCOMP:    "PTRACE_EVENT_SECCOMP",
 	syscall.PTRACE_EVENT_VFORK:      "PTRACE_EVENT_VFORK",
 	syscall.PTRACE_EVENT_VFORK_DONE: "PTRACE_EVENT_VFORK_DONE",
 }
