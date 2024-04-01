@@ -5,6 +5,7 @@ package ptrace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -264,6 +265,13 @@ func (m *monitor) Start() error {
 					if stopType == "signal_stop" {
 						childSig = int(stopSig)
 					}
+					if stopType == "ptrace_stop" {
+						newChildPID, _ := syscall.PtraceGetEventMsg(targetPid)
+						cause := wstat.TrapCause()
+						logger.Tracef("ptrace stop occured (%s), event pid = %d, continue...", PtraceEvenEnum(cause), newChildPID)
+						syscall.PtraceSyscall(int(newChildPID), 0)
+						continue
+					}
 					logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 				} else {
 					var regs unix.PtraceRegs
@@ -426,4 +434,34 @@ func startSignalForwarding(
 	}()
 
 	return cancel
+}
+
+func SigTrapCauseInfo(cause int) string {
+	if cause == -1 {
+		return fmt.Sprintf("(code=%d)", cause)
+	}
+
+	causeEnum := PtraceEvenEnum(cause)
+	info := fmt.Sprintf("(code=%d enum=%s)", cause, causeEnum)
+
+	return info
+}
+
+func PtraceEvenEnum(data int) string {
+	if enum, ok := ptEventMap[data]; ok {
+		return enum
+	} else {
+		return fmt.Sprintf("(%d)", data)
+	}
+}
+
+var ptEventMap = map[int]string{
+	syscall.PTRACE_EVENT_CLONE:      "PTRACE_EVENT_CLONE",
+	syscall.PTRACE_EVENT_EXEC:       "PTRACE_EVENT_EXEC",
+	syscall.PTRACE_EVENT_EXIT:       "PTRACE_EVENT_EXIT",
+	syscall.PTRACE_EVENT_FORK:       "PTRACE_EVENT_FORK",
+	unix.PTRACE_EVENT_SECCOMP:       "PTRACE_EVENT_SECCOMP",
+	unix.PTRACE_EVENT_STOP:          "PTRACE_EVENT_STOP",
+	syscall.PTRACE_EVENT_VFORK:      "PTRACE_EVENT_VFORK",
+	syscall.PTRACE_EVENT_VFORK_DONE: "PTRACE_EVENT_VFORK_DONE",
 }
