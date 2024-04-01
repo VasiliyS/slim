@@ -275,7 +275,7 @@ func (m *monitor) Start() error {
 				} else {
 					var regs unix.PtraceRegs
 
-					if err := unix.PtraceGetRegs(targetPid, &regs); err != nil {
+					if err := unix.PtraceGetRegs(pid, &regs); err != nil {
 						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
 						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
 					}
@@ -314,7 +314,7 @@ func (m *monitor) Start() error {
 					break
 				}
 				if pid != targetPid {
-					logger.Tracef("wait4 returned new pid(%d), expected(%d)", pid, targetPid)
+					logger.Tracef("wait4 returned child pid(%d), parent pid(%d)", pid, targetPid)
 				}
 
 				if gotCallNum && gotRetVal {
