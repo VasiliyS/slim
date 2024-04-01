@@ -243,12 +243,18 @@ func (m *monitor) Start() error {
 						syscall.PTRACE_EVENT_EXEC,
 						syscall.PTRACE_EVENT_EXIT:
 						stopType = "ptrace_event_stop"
+						if syscallReturn {
+							// previous syscall (e.g. clone) happened
+							// but will not be ended in a normal cycle
+							syscallReturn = false
+						}
 					case syscall.PTRACE_EVENT_SECCOMP:
 						stopType = "seccomp_stop"
 					default:
 						logger.Tracef("unknown ptrace event stop (%d)...", trapCause)
 						stopType = fmt.Sprintf("ptrace_%d_event", trapCause)
 					}
+				// these signals follow FORK for child processes, etc if ptracing clone, fork, etc
 				case syscall.SIGSTOP,
 					syscall.SIGTSTP,
 					syscall.SIGTTIN,
@@ -307,7 +313,7 @@ func (m *monitor) Start() error {
 					break
 				}
 
-				// wait for any child process to accommodate clones
+				// wait for any child process to accommodate clones, forks, etc.
 				pid, err = unix.Wait4(-1, &wstat, 0, nil)
 				if err != nil {
 					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
@@ -318,6 +324,10 @@ func (m *monitor) Start() error {
 				}
 
 				if gotCallNum && gotRetVal {
+					//TODO: need to figure out what to do with unpaired syscalls
+					// see above (e.g. ptrace_stops)
+					// this should go away(?) if tracking all new process creation calls
+					// these should be captured in under their own trap's (SIGRAP sig) cause
 					gotCallNum = false
 					gotRetVal = false
 
