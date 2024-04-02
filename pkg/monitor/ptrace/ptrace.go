@@ -1,5 +1,5 @@
-//go:build !arm64 && !s390x
-// +build !arm64,!s390x
+//go:build !arm64 && !s390x && linux
+// +build !arm64,!s390x,linux
 
 package ptrace
 

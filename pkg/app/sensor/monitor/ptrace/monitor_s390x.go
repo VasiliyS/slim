@@ -33,11 +33,19 @@ const (
 		unix.PTRACE_O_EXITKILL |
 		//	unix.PTRACE_O_TRACECLONE |
 		/*
-			Both _TRACEFORK & _TRACEVFORK
+			The O_TRACEFORK, O_TRACEVFORK, O_TRACECLONE
 			will start the new process with SIGSTOP!
+
+			So 2 events actually happen, with PtraceSyscall + Wait4 in between:
+			1. syscall entry stop at `clone`, etc
+			2. corresponding PTRACE_EVENT_*, delivered via SIGTRAP
+
+			and in case of O_TRACEVFORK, the 3rd event will follow:
+			3. a group stop  (SIGSTOP)
 		*/
 		unix.PTRACE_O_TRACEFORK |
-		unix.PTRACE_O_TRACEVFORK |
+		unix.PTRACE_O_TRACEVFORKDONE |
+		unix.PTRACE_O_TRACECLONE |
 		unix.PTRACE_O_TRACEEXIT
 
 	traceSysGoodStatusBit = 0x80
@@ -257,6 +265,7 @@ func (m *monitor) Start() error {
 					syscall.SIGTSTP,
 					syscall.SIGTTIN,
 					syscall.SIGTTOU:
+					// these are to be ignored. this is not a debugger.
 					stopType = "group_stop"
 				default:
 					stopType = "signal_stop"
