@@ -269,7 +269,7 @@ func (m *monitor) Start() error {
 						collectorDoneChan <- 4
 						break
 					}
-					logger.Tracef("[pid %d] - exited", pid)
+					logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
 					delete(procState, pid)
 
 				case wstat.Signaled():
@@ -372,7 +372,7 @@ func (m *monitor) Start() error {
 
 				// continue execution
 				err = unix.PtraceSyscall(pid, childSig)
-				if err != nil {
+				if err != nil && !wstat.Exited() {
 					logger.Warnf("unix.PtraceSyscall error: %v", err)
 					break
 				}
@@ -384,7 +384,7 @@ func (m *monitor) Start() error {
 					break
 				}
 				if pid != targetPid {
-					logger.Tracef("wait4 returned child pid(%d), parent pid(%d)", pid, targetPid)
+					logger.Tracef("wait4 returned a child pid(%d) of pid(%d)", pid, targetPid)
 				}
 
 				if childState.gotCallNum && childState.gotRetVal {
