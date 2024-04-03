@@ -33,15 +33,28 @@ const (
 		unix.PTRACE_O_EXITKILL |
 		//	unix.PTRACE_O_TRACECLONE |
 		/*
-			The O_TRACEFORK, O_TRACEVFORK, O_TRACECLONE
-			will start the new process with SIGSTOP!
+			The O_TRACEFORK, O_TRACEVFORK, O_TRACECLONE, O_TRACEVFORKDONE
+			have different behaviors, which is not so clearly documented in
+			https://man7.org/linux/man-pages/man2/ptrace.2.html:
+
+			O_TRACEFORK - will cause to start tracing new process automatically,
+			PtraceGetEventMsg will return the child PID, child continues without SIGSTOP(!)
+
+			O_TRACEVFORK - will also case tracing of the new process, but
+			PtraceGetEventMsg will return the pid of the process that called VFORK/CLONE
+			child will receive SIGSTOP, as stated in the manual
+
+			O_TRACECLONE - investigating. glibc wrappers for fork(), vfork() actually call clone3()
+			with various flags to achieve desired effect. The child is not receiving SIGSTOP, though.
+
+			O_TRACEVFORKDONE - will not cause tracing of the new process
 
 			So 2 events actually happen, with PtraceSyscall + Wait4 in between:
 			1. syscall entry stop at `clone`, etc
 			2. corresponding PTRACE_EVENT_*, delivered via SIGTRAP
 
 			and in case of O_TRACEVFORK, the 3rd event will follow:
-			3. a group stop  (SIGSTOP)
+			3. a group stop  (SIGSTOP), which allows ptrace'ing the new child process!
 		*/
 		unix.PTRACE_O_TRACEFORK |
 		unix.PTRACE_O_TRACEVFORKDONE |
@@ -195,7 +208,6 @@ func (m *monitor) Start() error {
 
 			var wstat unix.WaitStatus
 
-			//pid, err := syscall.Wait4(-1, &wstat, syscall.WALL, nil) - WIP
 			pid, err := unix.Wait4(targetPid, &wstat, 0, nil)
 			if err != nil {
 				logger.Warnf("unix.Wait4 - error waiting for %d: %v", targetPid, err)
@@ -230,6 +242,7 @@ func (m *monitor) Start() error {
 			syscallReturn := false
 			gotCallNum := false
 			gotRetVal := false
+			var callName string
 			var callNum uint64
 			var retVal uint64
 			for wstat.Stopped() {
@@ -282,37 +295,37 @@ func (m *monitor) Start() error {
 
 					if stopType == "signal_stop" {
 						childSig = int(stopSig)
+						logger.Tracef("[pid %d] injecting signal(%d) with the next PtraceSyscall...", pid, childSig)
 					}
 					if stopType == "ptrace_event_stop" {
-						newChildPID, _ := syscall.PtraceGetEventMsg(targetPid)
+						eventPID, _ := syscall.PtraceGetEventMsg(targetPid)
 						cause := wstat.TrapCause()
-						logger.Tracef("ptrace stop occured (%s), event pid = %d, continue...", PtraceEvenEnum(cause), newChildPID)
-						pid = int(newChildPID)
+						logger.Tracef("[pid %d] ptrace stop occured (%s), event pid = %d, syscall => %s, continue...", pid, PtraceEvenEnum(cause), eventPID, callName)
 					}
 					logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 				} else {
 					var regs unix.PtraceRegs
 
 					if err := unix.PtraceGetRegs(pid, &regs); err != nil {
-						//if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
 						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
 					}
 
 					switch syscallReturn {
 					case false:
-						logger.Tracef("before syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
 						callNum = system.CallNumber(regs)
+						callName = syscallResolver(uint32(callNum))
 						syscallReturn = true
 						gotCallNum = true
 
+						logger.Tracef("[pid %d] %s( <unfinished...> : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, callName, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 					case true:
-						logger.Tracef("after syscall: orig_r2=%d, r0=%d, r1=%d, r2=%d ", regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 
 						retVal = system.CallReturnValue(regs)
 						syscallReturn = false
 						gotRetVal = true
 
+						logger.Tracef("[pid %d] <... %s resumed>) = %d : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, callName, retVal, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 					}
 
 				}
@@ -326,7 +339,7 @@ func (m *monitor) Start() error {
 				}
 
 				// wait for any child process to accommodate clones, forks, etc.
-				pid, err = unix.Wait4(-1, &wstat, 0, nil)
+				pid, err = unix.Wait4(-1, &wstat, syscall.WALL, nil)
 				if err != nil {
 					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
 					break
@@ -377,7 +390,7 @@ func (m *monitor) Start() error {
 				break done
 			case e := <-eventChan:
 				ptReport.SyscallCount++
-				logger.Tracef("syscall ==> %d (%s)", e.callNum, syscallResolver(e.callNum))
+				//logger.Tracef("syscall ==> %d (%s)", e.callNum, syscallResolver(e.callNum))
 
 				if _, ok := syscallStats[e.callNum]; ok {
 					syscallStats[e.callNum]++
