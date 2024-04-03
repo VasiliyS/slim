@@ -70,6 +70,21 @@ type status struct {
 	err    error
 }
 
+// track tracing state of all child processes
+type ptraceState struct {
+	pid          int
+	callNum      uint64
+	callName     string
+	retVal       uint64
+	expectReturn bool
+	gotCallNum   bool
+	gotRetVal    bool
+	started      bool
+	exiting      bool
+	pathParam    string
+	pathParamErr error
+}
+
 type monitor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -227,25 +242,49 @@ func (m *monitor) Start() error {
 
 			logger.Debugf("initial process status = %v (pid=%d)", wstat, pid)
 
-			if wstat.Exited() {
-				logger.Warn("app exited (unexpected)")
-				collectorDoneChan <- 4
-				return
-			}
+			/*
+				syscallReturn := false
+				gotCallNum := false
+				gotRetVal := false
+				var callName string
+				var callNum uint64
+				var retVal uint64
+			*/
+			var procState map[int]*ptraceState = make(map[int]*ptraceState)
 
-			if wstat.Signaled() {
-				logger.Warn("app signalled (unexpected)")
-				collectorDoneChan <- 5
-				return
-			}
+			procState[targetPid] = &ptraceState{pid: targetPid, started: true}
+			for {
+				var childState *ptraceState
+				if state, ok := procState[pid]; !ok {
+					procState[pid] = &ptraceState{pid: pid}
+				} else {
+					childState = state
+				}
 
-			syscallReturn := false
-			gotCallNum := false
-			gotRetVal := false
-			var callName string
-			var callNum uint64
-			var retVal uint64
-			for wstat.Stopped() {
+				if wstat.Exited() {
+					if pid == targetPid {
+						logger.Warn("app exited (unexpected)")
+						collectorDoneChan <- 4
+						break
+					}
+					logger.Tracef("[pid %d] - exited", pid)
+					delete(procState, pid)
+					continue
+				}
+				if wstat.Signaled() {
+					logger.Warn("[pid %d]  - signalled (unexpected)", pid)
+					//collectorDoneChan <- 5
+					continue
+				}
+				if wstat.Continued() {
+					logger.Tracef("[pid %d] - continued", pid)
+					continue
+				}
+
+				if !wstat.Stopped() {
+					logger.Debugf("[pid %d] - bad state, should be stopped!", pid)
+					continue
+				}
 
 				var stopType string
 				stopSig := wstat.StopSignal()
@@ -266,7 +305,9 @@ func (m *monitor) Start() error {
 						stopType = "ptrace_event_stop"
 						// previous syscall (e.g. clone) happened
 						// but will not be ended in a normal cycle
-						syscallReturn = false
+						childState.expectReturn = false
+						childState.gotRetVal = true
+
 					case syscall.PTRACE_EVENT_SECCOMP:
 						stopType = "seccomp_stop"
 					default:
@@ -288,7 +329,7 @@ func (m *monitor) Start() error {
 					"stopSig=%d (%s), stop type => %v, syscallReturn(%v)",
 					int(stopSig), stopSig.String(),
 					stopType,
-					syscallReturn)
+					childState.expectReturn)
 
 				var childSig = int(0)
 				if stopType != "syscall_stop" {
@@ -300,37 +341,36 @@ func (m *monitor) Start() error {
 					if stopType == "ptrace_event_stop" {
 						eventPID, _ := syscall.PtraceGetEventMsg(targetPid)
 						cause := wstat.TrapCause()
-						logger.Tracef("[pid %d] ptrace stop occured (%s), event pid = %d, syscall => %s, continue...", pid, PtraceEvenEnum(cause), eventPID, callName)
+						logger.Tracef("[pid %d] ptrace stop occurred (%s), event pid = %d, syscall => %s, continue...", pid, PtraceEvenEnum(cause), eventPID, childState.callName)
 					}
 					logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 				} else {
 					var regs unix.PtraceRegs
 
 					if err := unix.PtraceGetRegs(pid, &regs); err != nil {
-						logger.Fatalf("unix.PtraceGetRegs(call): %v", err)
+						logger.Fatalf("[pid %d] unix.PtraceGetRegs(call): %v", pid, err)
 					}
 
-					switch syscallReturn {
+					switch childState.expectReturn {
 					case false:
 
-						callNum = system.CallNumber(regs)
-						callName = syscallResolver(uint32(callNum))
-						syscallReturn = true
-						gotCallNum = true
+						childState.callNum = system.CallNumber(regs)
+						childState.callName = syscallResolver(uint32(childState.callNum))
+						childState.expectReturn = true
+						childState.gotCallNum = true
 
-						logger.Tracef("[pid %d] %s( <unfinished...> : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, callName, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+						logger.Tracef("[pid %d] %s( <unfinished...> : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 					case true:
 
-						retVal = system.CallReturnValue(regs)
-						syscallReturn = false
-						gotRetVal = true
+						childState.retVal = system.CallReturnValue(regs)
+						childState.expectReturn = false
+						childState.gotRetVal = true
 
-						logger.Tracef("[pid %d] <... %s resumed>) = %d : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, callName, retVal, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+						logger.Tracef("[pid %d] <... %s resumed>) = %d : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, childState.retVal, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
 					}
 
 				}
 
-				//err = syscall.PtraceSyscall(pid, 0)
 				// continue execution
 				err = unix.PtraceSyscall(pid, childSig)
 				if err != nil {
@@ -348,18 +388,18 @@ func (m *monitor) Start() error {
 					logger.Tracef("wait4 returned child pid(%d), parent pid(%d)", pid, targetPid)
 				}
 
-				if gotCallNum && gotRetVal {
+				if childState.gotCallNum && childState.gotRetVal {
 					//TODO: need to figure out what to do with unpaired syscalls
 					// see above (e.g. ptrace_stops)
 					// this should go away(?) if tracking all new process creation calls
 					// these should be captured in under their own trap's (SIGRAP sig) cause
-					gotCallNum = false
-					gotRetVal = false
+					childState.gotCallNum = false
+					childState.gotRetVal = false
 
 					select {
 					case eventChan <- syscallEvent{
-						callNum: uint32(callNum),
-						retVal:  retVal,
+						callNum: uint32(childState.callNum),
+						retVal:  childState.retVal,
 					}:
 					case <-m.ctx.Done():
 						logger.Info("stopping...")
