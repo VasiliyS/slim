@@ -257,6 +257,7 @@ func (m *monitor) Start() error {
 				var childState *ptraceState
 				if state, ok := procState[pid]; !ok {
 					procState[pid] = &ptraceState{pid: pid}
+					childState = procState[pid]
 				} else {
 					childState = state
 				}
@@ -272,7 +273,7 @@ func (m *monitor) Start() error {
 					continue
 				}
 				if wstat.Signaled() {
-					logger.Warn("[pid %d]  - signalled (unexpected)", pid)
+					logger.Warnf("[pid %d]  - signalled (unexpected)", pid)
 					//collectorDoneChan <- 5
 					continue
 				}
