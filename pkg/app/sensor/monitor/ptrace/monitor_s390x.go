@@ -303,8 +303,9 @@ func (m *monitor) Start() error {
 							stopType = "ptrace_event_stop"
 							// previous syscall (e.g. clone) happened
 							// but will not be ended in a normal cycle
-							childState.expectReturn = false
-							childState.gotRetVal = true
+							// wait4 with WALL changes this behavior
+							//childState.expectReturn = false
+							//childState.gotRetVal = true
 
 						case syscall.PTRACE_EVENT_SECCOMP:
 							stopType = "seccomp_stop"
@@ -390,7 +391,7 @@ func (m *monitor) Start() error {
 					//TODO: need to figure out what to do with unpaired syscalls
 					// see above (e.g. ptrace_stops)
 					// this should go away(?) if tracking all new process creation calls
-					// these should be captured in under their own trap's (SIGRAP sig) cause
+					// these should be captured in under their own trap's (SIGTRAP sig) cause
 					childState.gotCallNum = false
 					childState.gotRetVal = false
 
