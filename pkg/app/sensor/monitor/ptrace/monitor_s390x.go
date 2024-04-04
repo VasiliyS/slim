@@ -255,29 +255,35 @@ func (m *monitor) Start() error {
 					childState = state
 				}
 
+				var childExited = false
+				var childSig = int(0) // not injecting a signal by default.
 				switch {
 				case wstat.Exited():
 					if pid == targetPid {
 						if !childState.exiting {
 							logger.Warn("app exited (unexpected)")
 						}
+						logger.Tracef("[pid %d] main process exited, stopping tracing", targetPid)
 						collectorDoneChan <- 4
 						break ptrace
 					}
 					logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
 					delete(procState, pid)
+					childExited = true
 
 				case wstat.Signaled():
+					if pid == targetPid {
+						logger.Debugf("[pid %d] main process unexpectedly terminated by a signal, stopping tracing", targetPid)
+						collectorDoneChan <- 5
+						break ptrace
+					}
 					logger.Warnf("[pid %d]  - signalled (unexpected)", pid)
-					//collectorDoneChan <- 5
+					childExited = true
 
 				case wstat.Continued():
 					logger.Tracef("[pid %d] - continued", pid)
 
-				}
-
-				var childSig = int(0) // not injecting a signal by default.
-				if wstat.Stopped() {
+				case wstat.Stopped():
 
 					var stopType string
 					stopSig := wstat.StopSignal()
@@ -305,12 +311,16 @@ func (m *monitor) Start() error {
 						case syscall.PTRACE_EVENT_EXIT:
 							stopType = "ptrace_event_stop"
 							childState.exiting = true
+							// setting this to true, to count unfinished syscalls
+							// e.g. `exit_group`, which will no longer reach `stopped` state
+							// after this event, then next stop after wait4 will SIGTRAP with status exited
+							childState.gotRetVal = true
 							if logger.Logger.IsLevelEnabled(log.TraceLevel) {
 								exitCode, err := syscall.PtraceGetEventMsg(pid)
 								if err != nil {
 									logger.Tracef("[pid %d] reported exit, failed to get exit code : %s", pid, err)
 								} else {
-									logger.Tracef("[pid %d] reported exit, exit status value: %d", pid, exitCode)
+									logger.Tracef("[pid %d] PTRACE_EVENT_EXIT, exit status value: %d", pid, exitCode)
 								}
 							}
 
@@ -375,7 +385,7 @@ func (m *monitor) Start() error {
 						}
 
 					}
-				} else {
+				default:
 					logger.Debugf(
 						"[pid %d] wait4 returned unexpected state: %d, stopped, continued, signalled, exited checked",
 						pid,
@@ -383,17 +393,35 @@ func (m *monitor) Start() error {
 					)
 				}
 
+				if childState.gotCallNum && childState.gotRetVal {
+					//TODO: need to figure out what to do with unpaired syscalls
+					// see above (e.g. ptrace_stops)
+					// this should go away(?) if tracking all new process creation calls
+					// these should be captured in under their own trap's (SIGTRAP sig) cause
+					childState.gotCallNum = false
+					childState.gotRetVal = false
+
+					select {
+					case eventChan <- syscallEvent{
+						callNum: uint32(childState.callNum),
+						retVal:  childState.retVal,
+					}:
+					case <-m.ctx.Done():
+						logger.Info("stopping...")
+						return
+					}
+				}
+
 				// continue execution
-				err = unix.PtraceSyscall(pid, childSig)
-				if err != nil {
-					// the process could've been killed, which is normal
-					if err.(syscall.Errno) != syscall.ESRCH {
-						logger.Errorf("[pid %d] trace syscall p sig=%v error - %v (errno=%d)", pid, childSig, err, err.(syscall.Errno))
-						m.appErrChan <- errors.SE("ptrace.App.collect.ptsyscall", "call.error", err)
-					} else {
-						logger.Debugf("[pid %d] PtraceSyscall returned ESRCH, ignoring", pid)
-						if !childState.exiting {
-							logger.Debugf("[pid %d] PtraceSyscall for the pid returned ESRCH error and its state is not 'exiting'", pid)
+				if !childExited {
+					err = unix.PtraceSyscall(pid, childSig)
+					if err != nil {
+						// the process could've been killed, which is normal
+						if err.(syscall.Errno) != syscall.ESRCH {
+							logger.Errorf("[pid %d] trace syscall p sig=%v error - %v (errno=%d)", pid, childSig, err, err.(syscall.Errno))
+							m.appErrChan <- errors.SE("ptrace.App.collect.ptsyscall", "call.error", err)
+						} else {
+							logger.Debugf("[pid %d] PtraceSyscall returned ESRCH ignoring (most likely killed)", pid)
 						}
 					}
 				}
@@ -418,24 +446,6 @@ func (m *monitor) Start() error {
 					logger.Tracef("wait4 returned a child pid(%d) of pid(%d)", pid, targetPid)
 				}
 
-				if childState.gotCallNum && childState.gotRetVal {
-					//TODO: need to figure out what to do with unpaired syscalls
-					// see above (e.g. ptrace_stops)
-					// this should go away(?) if tracking all new process creation calls
-					// these should be captured in under their own trap's (SIGTRAP sig) cause
-					childState.gotCallNum = false
-					childState.gotRetVal = false
-
-					select {
-					case eventChan <- syscallEvent{
-						callNum: uint32(childState.callNum),
-						retVal:  childState.retVal,
-					}:
-					case <-m.ctx.Done():
-						logger.Info("stopping...")
-						return
-					}
-				}
 			}
 
 			logger.Infof("exiting... status=%v", wstat)
