@@ -38,26 +38,29 @@ const (
 			https://man7.org/linux/man-pages/man2/ptrace.2.html:
 
 			O_TRACEFORK - will cause to start tracing new process automatically,
-			PtraceGetEventMsg will return the child PID, child continues without SIGSTOP(!)
+			PtraceGetEventMsg will return the child PID
 
 			O_TRACEVFORK - will also case tracing of the new process, but
 			PtraceGetEventMsg will return the pid of the process that called VFORK/CLONE
 			child will receive SIGSTOP, as stated in the manual
 
-			O_TRACECLONE - investigating. glibc wrappers for fork(), vfork() actually call clone3()
-			with various flags to achieve desired effect. The child is not receiving SIGSTOP, though.
+			O_TRACECLONE - glibc wrappers for fork(), vfork() actually call clone3()
+			with various flags to achieve desired effect. This will also cause tracing of the new
+			child process
 
 			O_TRACEVFORKDONE - will not cause tracing of the new process
 
-			So 2 events actually happen, with PtraceSyscall + Wait4 in between:
-			1. syscall entry stop at `clone`, etc
-			2. corresponding PTRACE_EVENT_*, delivered via SIGTRAP
+			So the following events actually happen, with PtraceSyscall + Wait4 in between each event:
+			1. syscall entry stop at `clone`, etc (calling pid)
+			2. corresponding PTRACE_EVENT_*, delivered via SIGTRAP (calling pid)
+			3. a group stop (SIGSTOP) at child pid, which pauses the new child process!
+			4. syscall exit stop to finish interrupted syscall (calling pid)
 
-			and in case of O_TRACEVFORK, the 3rd event will follow:
-			3. a group stop  (SIGSTOP), which allows ptrace'ing the new child process!
+			in a multithreaded  app events form other threads will happen in between them, so it's
+			required to track the state of each of the pid to match the events (entry and stops)
 		*/
 		unix.PTRACE_O_TRACEFORK |
-		unix.PTRACE_O_TRACEVFORKDONE |
+		unix.PTRACE_O_TRACEVFORK |
 		unix.PTRACE_O_TRACECLONE |
 		unix.PTRACE_O_TRACEEXIT
 
@@ -72,14 +75,14 @@ type status struct {
 
 // track tracing state of all child processes
 type ptraceState struct {
-	pid          int
+	//pid          int
 	callNum      uint64
 	callName     string
 	retVal       uint64
 	expectReturn bool
 	gotCallNum   bool
 	gotRetVal    bool
-	started      bool
+	//started      bool
 	exiting      bool
 	pathParam    string
 	pathParamErr error
@@ -104,6 +107,8 @@ type monitor struct {
 
 	status status
 	doneCh chan struct{}
+
+	appErrChan chan<- error
 }
 
 func NewMonitor(
@@ -133,6 +138,8 @@ func NewMonitor(
 		signalCh: signalCh,
 
 		doneCh: make(chan struct{}),
+
+		appErrChan: errorCh,
 	}
 }
 
@@ -212,13 +219,6 @@ func (m *monitor) Start() error {
 
 			targetPid := app.Process.Pid
 
-			//pgid, err := syscall.Getpgid(targetPid)
-			//if err != nil {
-			//	log.Warnf("ptmon: collector - getpgid error %d: %v", targetPid, err)
-			//	collectorDoneChan <- 1
-			//	return
-			//}
-
 			logger.Debugf("target PID ==> %d", targetPid)
 
 			var wstat unix.WaitStatus
@@ -242,21 +242,14 @@ func (m *monitor) Start() error {
 
 			logger.Debugf("initial process status = %v (pid=%d)", wstat, pid)
 
-			/*
-				syscallReturn := false
-				gotCallNum := false
-				gotRetVal := false
-				var callName string
-				var callNum uint64
-				var retVal uint64
-			*/
 			var procState map[int]*ptraceState = make(map[int]*ptraceState)
 
-			procState[targetPid] = &ptraceState{pid: targetPid, started: true}
+			procState[targetPid] = &ptraceState{}
+		ptrace:
 			for {
 				var childState *ptraceState
 				if state, ok := procState[pid]; !ok {
-					procState[pid] = &ptraceState{pid: pid}
+					procState[pid] = &ptraceState{}
 					childState = procState[pid]
 				} else {
 					childState = state
@@ -265,9 +258,11 @@ func (m *monitor) Start() error {
 				switch {
 				case wstat.Exited():
 					if pid == targetPid {
-						logger.Warn("app exited (unexpected)")
+						if !childState.exiting {
+							logger.Warn("app exited (unexpected)")
+						}
 						collectorDoneChan <- 4
-						break
+						break ptrace
 					}
 					logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
 					delete(procState, pid)
@@ -281,7 +276,7 @@ func (m *monitor) Start() error {
 
 				}
 
-				var childSig = int(0)
+				var childSig = int(0) // not injecting a signal by default.
 				if wstat.Stopped() {
 
 					var stopType string
@@ -297,15 +292,27 @@ func (m *monitor) Start() error {
 						case syscall.PTRACE_EVENT_CLONE,
 							syscall.PTRACE_EVENT_FORK,
 							syscall.PTRACE_EVENT_VFORK,
-							syscall.PTRACE_EVENT_VFORK_DONE,
-							syscall.PTRACE_EVENT_EXEC,
-							syscall.PTRACE_EVENT_EXIT:
+							syscall.PTRACE_EVENT_EXEC:
+
 							stopType = "ptrace_event_stop"
-							// previous syscall (e.g. clone) happened
-							// but will not be ended in a normal cycle
-							// wait4 with WALL changes this behavior
-							//childState.expectReturn = false
-							//childState.gotRetVal = true
+							if newPID, err := syscall.PtraceGetEventMsg(targetPid); err != nil {
+								logger.Debugf("[pid %d] received '%s' event, failed to get the pid of the new process: %s", pid, ptraceEventEnum(trapCause), err)
+							} else {
+								procState[int(newPID)] = &ptraceState{}
+								logger.Tracef("[pid %d] ptrace stop occurred (%s), event pid = %d, syscall => %s, continue...", pid, ptraceEventEnum(trapCause), newPID, childState.callName)
+							}
+
+						case syscall.PTRACE_EVENT_EXIT:
+							stopType = "ptrace_event_stop"
+							childState.exiting = true
+							if logger.Logger.IsLevelEnabled(log.TraceLevel) {
+								exitCode, err := syscall.PtraceGetEventMsg(pid)
+								if err != nil {
+									logger.Tracef("[pid %d] reported exit, failed to get exit code : %s", pid, err)
+								} else {
+									logger.Tracef("[pid %d] reported exit, exit status value: %d", pid, exitCode)
+								}
+							}
 
 						case syscall.PTRACE_EVENT_SECCOMP:
 							stopType = "seccomp_stop"
@@ -321,12 +328,16 @@ func (m *monitor) Start() error {
 						// these are to be ignored. this is not a debugger.
 						stopType = "group_stop"
 					default:
+						// a signal that likely has to be injected back to the traced process
+						// theoretically, signal forwarder will not see this, as it's sent to a process of the tracee
+						// whereas signal forwarder sees only the signals delivered to the sensor's main process
 						stopType = "signal_stop"
 					}
 
 					logger.Tracef(
-						"stopSig=%d (%s), stop type => %v, syscallReturn(%v)",
-						int(stopSig), stopSig.String(),
+						"[pid %d] stopSig=> %s, stop type => %v, syscallReturn(%v)",
+						pid,
+						stopSignalInfo(stopSig),
 						stopType,
 						childState.expectReturn)
 
@@ -336,11 +347,7 @@ func (m *monitor) Start() error {
 							childSig = int(stopSig)
 							logger.Tracef("[pid %d] injecting signal(%d) with the next PtraceSyscall...", pid, childSig)
 						}
-						if stopType == "ptrace_event_stop" {
-							eventPID, _ := syscall.PtraceGetEventMsg(targetPid)
-							cause := wstat.TrapCause()
-							logger.Tracef("[pid %d] ptrace stop occurred (%s), event pid = %d, syscall => %s, continue...", pid, PtraceEvenEnum(cause), eventPID, childState.callName)
-						}
+
 						logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
 					} else {
 						var regs unix.PtraceRegs
@@ -368,20 +375,44 @@ func (m *monitor) Start() error {
 						}
 
 					}
+				} else {
+					logger.Debugf(
+						"[pid %d] wait4 returned unexpected state: %d, stopped, continued, signalled, exited checked",
+						pid,
+						wstat,
+					)
 				}
 
 				// continue execution
 				err = unix.PtraceSyscall(pid, childSig)
-				if err != nil && !wstat.Exited() {
-					logger.Warnf("unix.PtraceSyscall error: %v", err)
-					break
+				if err != nil {
+					// the process could've been killed, which is normal
+					if err.(syscall.Errno) != syscall.ESRCH {
+						logger.Errorf("[pid %d] trace syscall p sig=%v error - %v (errno=%d)", pid, childSig, err, err.(syscall.Errno))
+						m.appErrChan <- errors.SE("ptrace.App.collect.ptsyscall", "call.error", err)
+					} else {
+						logger.Debugf("[pid %d] PtraceSyscall returned ESRCH, ignoring", pid)
+						if !childState.exiting {
+							logger.Debugf("[pid %d] PtraceSyscall for the pid returned ESRCH error and its state is not 'exiting'", pid)
+						}
+					}
 				}
 
 				// wait for any child process to accommodate clones, forks, etc.
 				pid, err = unix.Wait4(-1, &wstat, syscall.WALL, nil)
 				if err != nil {
-					logger.Warnf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
-					break
+					if err.(syscall.Errno) == syscall.ECHILD {
+						logger.Debugf("[pid %d] wait4 returned ECHILD error, there nothing more to collect, ...", pid)
+						if !procState[targetPid].exiting {
+							logger.Debugf("[pid %d] has no children to track and but is not in 'exiting' state", targetPid)
+						}
+						break ptrace
+					} else {
+						logger.Debugf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
+						m.appErrChan <- errors.SE("ptrace.App.collect.wait4", "call.error", err)
+						collectorDoneChan <- 2
+						return
+					}
 				}
 				if pid != targetPid {
 					logger.Tracef("wait4 returned a child pid(%d) of pid(%d)", pid, targetPid)
@@ -488,12 +519,18 @@ func startSignalForwarding(
 				return
 
 			case s := <-signalCh:
-				log.WithField("signal", s).Debug("ptmon: signal forwarder - received signal")
+
+				var reportSignal = true
+				if s == syscall.SIGCHLD && log.IsLevelEnabled(log.TraceLevel) {
+					reportSignal = false
+				}
+				if reportSignal {
+					log.WithField("signal", s).Debug("ptmon: signal forwarder - received signal")
+				}
 
 				if s == syscall.SIGCHLD {
 					continue
 				}
-
 				log.WithField("signal", s).Debug("ptmon: signal forwarder - forwarding signal")
 
 				if err := app.Process.Signal(s); err != nil {
@@ -509,18 +546,7 @@ func startSignalForwarding(
 	return cancel
 }
 
-func SigTrapCauseInfo(cause int) string {
-	if cause == -1 {
-		return fmt.Sprintf("(code=%d)", cause)
-	}
-
-	causeEnum := PtraceEvenEnum(cause)
-	info := fmt.Sprintf("(code=%d enum=%s)", cause, causeEnum)
-
-	return info
-}
-
-func PtraceEvenEnum(data int) string {
+func ptraceEventEnum(data int) string {
 	if enum, ok := ptEventMap[data]; ok {
 		return enum
 	} else {
@@ -536,4 +562,83 @@ var ptEventMap = map[int]string{
 	syscall.PTRACE_EVENT_SECCOMP:    "PTRACE_EVENT_SECCOMP",
 	syscall.PTRACE_EVENT_VFORK:      "PTRACE_EVENT_VFORK",
 	syscall.PTRACE_EVENT_VFORK_DONE: "PTRACE_EVENT_VFORK_DONE",
+}
+
+func stopSignalInfo(sig syscall.Signal) string {
+	sigNum := int(sig)
+	if sigNum == -1 {
+		return fmt.Sprintf("(code=%d)", sigNum)
+	}
+
+	sigEnum := signalEnum(sigNum)
+	sigStr := sig.String()
+	if sig&traceSysGoodStatusBit == traceSysGoodStatusBit {
+		msig := sig &^ traceSysGoodStatusBit
+		sigEnum = fmt.Sprintf("%s|0x%04x", signalEnum(int(msig)), traceSysGoodStatusBit)
+		sigStr = fmt.Sprintf("%s|0x%04x", msig, traceSysGoodStatusBit)
+	}
+
+	info := fmt.Sprintf("(code=%d/0x%04x enum='%s' str='%s')",
+		sigNum, sigNum, sigEnum, sigStr)
+
+	return info
+}
+
+func sigTrapCauseInfo(cause int) string {
+	if cause == -1 {
+		return fmt.Sprintf("(code=%d)", cause)
+	}
+
+	causeEnum := ptraceEventEnum(cause)
+	info := fmt.Sprintf("(code=%d enum=%s)", cause, causeEnum)
+
+	return info
+}
+
+func signalEnum(sigNum int) string {
+	if sigNum >= len(sigEnums) || sigNum < 0 {
+		return fmt.Sprintf("BAD(%d)", sigNum)
+	}
+
+	e := sigEnums[sigNum]
+	if e == "" {
+		e = fmt.Sprintf("UNKNOWN(%d)", sigNum)
+	}
+
+	return e
+}
+
+var sigEnums = [...]string{
+	0:                 "(NOSIGNAL)",
+	syscall.SIGABRT:   "SIGABRT/SIGIOT",
+	syscall.SIGALRM:   "SIGALRM",
+	syscall.SIGBUS:    "SIGBUS",
+	syscall.SIGCHLD:   "SIGCHLD",
+	syscall.SIGCONT:   "SIGCONT",
+	syscall.SIGFPE:    "SIGFPE",
+	syscall.SIGHUP:    "SIGHUP",
+	syscall.SIGILL:    "SIGILL",
+	syscall.SIGINT:    "SIGINT",
+	syscall.SIGKILL:   "SIGKILL",
+	syscall.SIGPIPE:   "SIGPIPE",
+	syscall.SIGPOLL:   "SIGIO/SIGPOLL",
+	syscall.SIGPROF:   "SIGPROF",
+	syscall.SIGPWR:    "SIGPWR",
+	syscall.SIGQUIT:   "SIGQUIT",
+	syscall.SIGSEGV:   "SIGSEGV",
+	syscall.SIGSTKFLT: "SIGSTKFLT",
+	syscall.SIGSTOP:   "SIGSTOP",
+	syscall.SIGSYS:    "SIGSYS",
+	syscall.SIGTERM:   "SIGTERM",
+	syscall.SIGTRAP:   "SIGTRAP",
+	syscall.SIGTSTP:   "SIGTSTP",
+	syscall.SIGTTIN:   "SIGTTIN",
+	syscall.SIGTTOU:   "SIGTTOU",
+	syscall.SIGURG:    "SIGURG",
+	syscall.SIGUSR1:   "SIGUSR1",
+	syscall.SIGUSR2:   "SIGUSR2",
+	syscall.SIGVTALRM: "SIGVTALRM",
+	syscall.SIGWINCH:  "SIGWINCH",
+	syscall.SIGXCPU:   "SIGXCPU",
+	syscall.SIGXFSZ:   "SIGXFSZ",
 }
