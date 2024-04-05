@@ -23,6 +23,7 @@ import (
 )
 
 type syscallEvent struct {
+	pid     int
 	callNum uint32
 	retVal  uint64
 }
@@ -31,7 +32,6 @@ const (
 	eventBufSize = 500
 	ptOptions    = unix.PTRACE_O_TRACESYSGOOD | // flag syscall-stops with SIGTRAP|0x80 signal
 		unix.PTRACE_O_EXITKILL |
-		//	unix.PTRACE_O_TRACECLONE |
 		/*
 			The O_TRACEFORK, O_TRACEVFORK, O_TRACECLONE, O_TRACEVFORKDONE
 			have different behaviors, which is not so clearly documented in
@@ -44,9 +44,9 @@ const (
 			PtraceGetEventMsg will return the pid of the process that called VFORK/CLONE
 			child will receive SIGSTOP, as stated in the manual
 
-			O_TRACECLONE - glibc wrappers for fork(), vfork() actually call clone3()
-			with various flags to achieve desired effect. This will also cause tracing of the new
-			child process
+			O_TRACECLONE - glibc wrappers for fork() actually call clone3()
+			with a specific set of  flags to achieve desired effect
+			Child will receive SIGSTOP, as stated in the manual
 
 			O_TRACEVFORKDONE - will not cause tracing of the new process
 
@@ -62,6 +62,15 @@ const (
 		unix.PTRACE_O_TRACEFORK |
 		unix.PTRACE_O_TRACEVFORK |
 		unix.PTRACE_O_TRACECLONE |
+		/*
+		   Notes on O_TRACEEXIT
+		   Upon exit calls ( exit, exit_group, and signal deaths)
+		   the tracer will receive SIGTRAP with PTRACE_EVENT_EXIT as its cause
+		   then after PtraceSyscall/Wait4 pair the tracer will get wstatus equal to Exited
+		   the syscall which started the exit mechanism will not be finished!
+		   Generally speaking, using the Exited status should be enough, this is not a debugger, but why not.
+
+		*/
 		unix.PTRACE_O_TRACEEXIT
 
 	traceSysGoodStatusBit = 0x80
@@ -153,19 +162,74 @@ func (m *monitor) Start() error {
 		"args": m.runOpt.Args,
 	}).Debug("starting target app...")
 
-	sysInfo := system.GetSystemInfo()
-	archName := system.MachineToArchName(sysInfo.Machine)
-	syscallResolver := system.CallNumberResolver(archName)
-
 	appName := m.runOpt.Cmd
 	appArgs := m.runOpt.Args
 	workDir := m.runOpt.WorkDir
 	appUser := m.runOpt.User
 	runTargetAsUser := m.runOpt.RunAsUser
 	rtaSourcePT := m.runOpt.RTASourcePT
-	// TODO(ivan): Implement the runOpt.ReportOnMainPidExit handling.
 
-	// The sync part of the start was successful.
+	var err error
+	var app *exec.Cmd
+
+	app, err = launcher.Start(
+		appName,
+		appArgs,
+		workDir,
+		appUser,
+		runTargetAsUser,
+		rtaSourcePT,
+		m.runOpt.AppStdout,
+		m.runOpt.AppStderr,
+	)
+	if err != nil {
+		m.status.err = errors.SE("sensor.ptrace.Run/launcher.Start", "call.error", err)
+		close(m.doneCh)
+		return nil
+	}
+
+	targetPid := app.Process.Pid
+	cancelSignalForwarding := startSignalForwarding(m.ctx, app, m.signalCh)
+	defer cancelSignalForwarding()
+
+	sysInfo := system.GetSystemInfo()
+	archName := system.MachineToArchName(sysInfo.Machine)
+
+	ptReport := &report.PtMonitorReport{
+		Enabled:      rtaSourcePT,
+		ArchName:     string(archName),
+		SyscallStats: map[string]report.SyscallStatInfo{},
+	}
+
+	if rtaSourcePT {
+		m.runPTrace(targetPid, ptReport)
+	} else {
+		go func() {
+			if err := app.Wait(); err != nil {
+				logger.WithError(err).Debug("not tracing target app - state<-AppFailed")
+				m.status.err = err
+			} else {
+				logger.Debug("not tracing target app - state<-AppDone")
+			}
+			m.status.report = ptReport
+		}()
+	}
+	//NOTE: need a better way to stop the target app...
+	if err := app.Process.Signal(unix.SIGTERM); err != nil {
+		logger.Warnf("app.Process.Signal(unix.SIGTERM) - error stopping target app => %v", err)
+		if err := app.Process.Kill(); err != nil {
+			logger.Warnf("app.Process.Kill - error killing target app => %v", *app)
+		}
+	}
+
+	return nil
+}
+
+func (m *monitor) runPTrace(targetPid int, ptReport *report.PtMonitorReport) {
+
+	archName := system.ArchName(ptReport.ArchName)
+
+	syscallResolver := system.CallNumberResolver(archName)
 
 	// Starting the async part...
 	go func() {
@@ -173,16 +237,9 @@ func (m *monitor) Start() error {
 		logger.Debug("call")
 		defer logger.Debug("exit")
 
-		ptReport := &report.PtMonitorReport{
-			ArchName:     string(archName),
-			SyscallStats: map[string]report.SyscallStatInfo{},
-		}
-
 		syscallStats := map[uint32]uint64{}
 		eventChan := make(chan syscallEvent, eventBufSize)
 		collectorDoneChan := make(chan int, 1)
-
-		var app *exec.Cmd
 
 		go func() {
 			logger := log.WithField("op", "sensor.pt.monitor.collector")
@@ -192,32 +249,6 @@ func (m *monitor) Start() error {
 			//IMPORTANT:
 			//Ptrace is not pretty... and it requires that you do all ptrace calls from the same thread
 			runtime.LockOSThread()
-
-			var err error
-			app, err = launcher.Start(
-				appName,
-				appArgs,
-				workDir,
-				appUser,
-				runTargetAsUser,
-				rtaSourcePT,
-				m.runOpt.AppStdout,
-				m.runOpt.AppStderr,
-			)
-			if err != nil {
-				m.status.err = errors.SE("sensor.ptrace.Run/launcher.Start", "call.error", err)
-				close(m.doneCh)
-				return
-			}
-
-			// TODO: Apparently, rtaSourcePT is ignored by this below code.
-			//       The x86-64 version of it has an alternative code branch
-			//       to run the target app w/o tracing.
-
-			cancelSignalForwarding := startSignalForwarding(m.ctx, app, m.signalCh)
-			defer cancelSignalForwarding()
-
-			targetPid := app.Process.Pid
 
 			logger.Debugf("target PID ==> %d", targetPid)
 
@@ -259,16 +290,23 @@ func (m *monitor) Start() error {
 				var childSig = int(0) // not injecting a signal by default.
 				switch {
 				case wstat.Exited():
+					var rc int = 0
 					if pid == targetPid {
 						if !childState.exiting {
 							logger.Warn("app exited (unexpected)")
+							rc = 4
+						} else {
+							rc = 0
 						}
-						logger.Tracef("[pid %d] main process exited, stopping tracing", targetPid)
-						collectorDoneChan <- 4
-						break ptrace
+						if m.runOpt.ReportOnMainPidExit {
+							collectorDoneChan <- rc
+							logger.Tracef("[pid %d] main process exited, stopping tracing", targetPid)
+							break ptrace
+						}
+					} else {
+						logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
+						delete(procState, pid)
 					}
-					logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
-					delete(procState, pid)
 					childExited = true
 
 				case wstat.Signaled():
@@ -403,6 +441,7 @@ func (m *monitor) Start() error {
 
 					select {
 					case eventChan <- syscallEvent{
+						pid:     pid,
 						callNum: uint32(childState.callNum),
 						retVal:  childState.retVal,
 					}:
@@ -433,6 +472,8 @@ func (m *monitor) Start() error {
 						logger.Debugf("[pid %d] wait4 returned ECHILD error, there nothing more to collect, ...", pid)
 						if !procState[targetPid].exiting {
 							logger.Debugf("[pid %d] has no children to track and but is not in 'exiting' state", targetPid)
+							collectorDoneChan <- 4 // failed main app
+							return
 						}
 						break ptrace
 					} else {
@@ -460,23 +501,27 @@ func (m *monitor) Start() error {
 				break done
 			case <-m.ctx.Done():
 				logger.Info("stopping...")
-				//NOTE: need a better way to stop the target app...
-				if err := app.Process.Signal(unix.SIGTERM); err != nil {
-					logger.Warnf("app.Process.Signal(unix.SIGTERM) - error stopping target app => %v", err)
-					if err := app.Process.Kill(); err != nil {
-						logger.Warnf("app.Process.Kill - error killing target app => %v", *app)
-					}
-				}
+
 				break done
 			case e := <-eventChan:
 				ptReport.SyscallCount++
 				//logger.Tracef("syscall ==> %d (%s)", e.callNum, syscallResolver(e.callNum))
 
-				if _, ok := syscallStats[e.callNum]; ok {
-					syscallStats[e.callNum]++
-				} else {
-					syscallStats[e.callNum] = 1
-				}
+				syscallStats[e.callNum]++
+			}
+		}
+
+	drain:
+		for {
+			select {
+			case e := <-eventChan:
+				ptReport.SyscallCount++
+				logger.Tracef("event (drained) ==> {pid=%v cn=%d}", e.pid, e.callNum)
+				syscallStats[e.callNum]++
+
+			default:
+				logger.Trace("event draining is finished")
+				break drain
 			}
 		}
 
@@ -498,7 +543,6 @@ func (m *monitor) Start() error {
 		close(m.doneCh)
 	}()
 
-	return nil
 }
 
 func (m *monitor) Cancel() {
