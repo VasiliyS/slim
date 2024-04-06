@@ -114,10 +114,20 @@ type monitor struct {
 	// To receive signals that should be delivered to the target app.
 	signalCh <-chan os.Signal
 
+	// used to report critical errors
+	// will be read by the sensor's main app to reason
+	// wether or not the tracing completed successfully
+	// and get access to the final PtMonitorReport
 	status status
-	doneCh chan struct{}
 
+	// sensor's main app ( controlled or standalone) will
+	// log and publish errors sent here as non-critical)
+	// standalone: save to a log file
+	// controlled: send back to the slim app via IPC
 	appErrChan chan<- error
+	// used to via Monitor interface's Done method to let CompositeMonitor know that
+	// all is done, has to be closed
+	doneCh chan struct{}
 }
 
 func NewMonitor(
@@ -146,21 +156,12 @@ func NewMonitor(
 
 		signalCh: signalCh,
 
-		doneCh: make(chan struct{}),
-
 		appErrChan: errorCh,
+		doneCh:     make(chan struct{}),
 	}
 }
 
-func (m *monitor) Start() error {
-	logger := log.WithField("op", "sensor.pt.monitor.Start")
-	logger.Info("call")
-	defer logger.Info("exit")
-
-	logger.WithFields(log.Fields{
-		"name": m.runOpt.Cmd,
-		"args": m.runOpt.Args,
-	}).Debug("starting target app...")
+func (m *monitor) appStart(logger *log.Entry) (*exec.Cmd, error) {
 
 	appName := m.runOpt.Cmd
 	appArgs := m.runOpt.Args
@@ -169,10 +170,12 @@ func (m *monitor) Start() error {
 	runTargetAsUser := m.runOpt.RunAsUser
 	rtaSourcePT := m.runOpt.RTASourcePT
 
-	var err error
-	var app *exec.Cmd
+	logger.WithFields(log.Fields{
+		"name": appName,
+		"args": appArgs,
+	}).Debug("starting target app...")
 
-	app, err = launcher.Start(
+	return launcher.Start(
 		appName,
 		appArgs,
 		workDir,
@@ -182,29 +185,75 @@ func (m *monitor) Start() error {
 		m.runOpt.AppStdout,
 		m.runOpt.AppStderr,
 	)
-	if err != nil {
-		m.status.err = errors.SE("sensor.ptrace.Run/launcher.Start", "call.error", err)
-		close(m.doneCh)
-		return nil
-	}
 
-	targetPid := app.Process.Pid
-	cancelSignalForwarding := startSignalForwarding(m.ctx, app, m.signalCh)
-	defer cancelSignalForwarding()
+}
+
+func (m *monitor) Start() error {
+	logger := log.WithField("op", "sensor.pt.monitor.Start")
+	logger.Info("call")
+	defer logger.Info("exit")
 
 	sysInfo := system.GetSystemInfo()
 	archName := system.MachineToArchName(sysInfo.Machine)
 
 	ptReport := &report.PtMonitorReport{
-		Enabled:      rtaSourcePT,
+		Enabled:      m.runOpt.RTASourcePT,
 		ArchName:     string(archName),
 		SyscallStats: map[string]report.SyscallStatInfo{},
 	}
 
-	if rtaSourcePT {
-		m.runPTrace(targetPid, ptReport)
-	} else {
+	if m.runOpt.RTASourcePT {
+
+		eventChan := make(chan syscallEvent, eventBufSize)
+		//TODO: will be closed in runCollector, or should it be closed via defer here?
+		collectorDoneChan := make(chan int, 1)
+
+		logger.Debug("starting ptrace process")
+		go m.runCollector(eventChan, collectorDoneChan, ptReport)
+
 		go func() {
+
+			//TODO: move all init to runPTrace
+			runtime.LockOSThread()
+
+			app, err := m.appStart(logger)
+
+			if err != nil {
+				err = errors.SE("sensor.ptrace.Run/launcher.Start", "call.error", err)
+				m.status.err = err
+				m.appErrChan <- err
+				collectorDoneChan <- 1
+				return
+			}
+			cancelSignalForwarding := startSignalForwarding(m.ctx, app, m.signalCh)
+			defer cancelSignalForwarding()
+			targetPid := app.Process.Pid
+
+			m.runPTrace(eventChan, collectorDoneChan, targetPid, ptReport)
+
+			//NOTE: need a better way to stop the target app...
+			if err := app.Process.Signal(unix.SIGTERM); err != nil {
+				logger.Warnf("app.Process.Signal(unix.SIGTERM) - error stopping target app => %v", err)
+				if err := app.Process.Kill(); err != nil {
+					logger.Warnf("app.Process.Kill - error killing target app => %v", *app)
+				}
+			}
+
+		}()
+	} else {
+		logger.Debug("starting target app with out tracing")
+		//TODO: move to a separate method, e.g. `runTargetApp`
+		go func() {
+			app, err := m.appStart(logger)
+
+			if err != nil {
+				err = errors.SE("sensor.ptrace.Run/launcher.Start", "call.error", err)
+				m.status.err = err
+				m.appErrChan <- err
+				return
+			}
+			cancelSignalForwarding := startSignalForwarding(m.ctx, app, m.signalCh)
+			defer cancelSignalForwarding()
 			if err := app.Wait(); err != nil {
 				logger.WithError(err).Debug("not tracing target app - state<-AppFailed")
 				m.status.err = err
@@ -212,336 +261,334 @@ func (m *monitor) Start() error {
 				logger.Debug("not tracing target app - state<-AppDone")
 			}
 			m.status.report = ptReport
+			close(m.doneCh)
 		}()
-	}
-	//NOTE: need a better way to stop the target app...
-	if err := app.Process.Signal(unix.SIGTERM); err != nil {
-		logger.Warnf("app.Process.Signal(unix.SIGTERM) - error stopping target app => %v", err)
-		if err := app.Process.Kill(); err != nil {
-			logger.Warnf("app.Process.Kill - error killing target app => %v", *app)
-		}
 	}
 
 	return nil
 }
 
-func (m *monitor) runPTrace(targetPid int, ptReport *report.PtMonitorReport) {
+func (m *monitor) runCollector(eventChan chan syscallEvent, collectorDoneChan chan int, ptReport *report.PtMonitorReport) {
+	logger := log.WithField("op", "sensor.pt.monitor.collector")
+	logger.Debug("call")
+	defer logger.Debug("exit")
 
+	syscallStats := map[uint32]uint64{}
+
+	//TODO: put in a shared struct, e.g. `ptraceProcess`
 	archName := system.ArchName(ptReport.ArchName)
-
 	syscallResolver := system.CallNumberResolver(archName)
 
-	// Starting the async part...
-	go func() {
-		logger := log.WithField("op", "sensor.pt.monitor.processor")
-		logger.Debug("call")
-		defer logger.Debug("exit")
+done:
+	for {
+		select {
+		case rc := <-collectorDoneChan:
+			logger.Info("collector finished =>", rc)
+			break done
+		case <-m.ctx.Done():
+			logger.Info("stopping...")
 
-		syscallStats := map[uint32]uint64{}
-		eventChan := make(chan syscallEvent, eventBufSize)
-		collectorDoneChan := make(chan int, 1)
+			break done
+		case e := <-eventChan:
+			ptReport.SyscallCount++
 
-		go func() {
-			logger := log.WithField("op", "sensor.pt.monitor.collector")
-			logger.Debug("call")
-			defer logger.Debug("exit")
+			syscallStats[e.callNum]++
+		}
+	}
 
-			//IMPORTANT:
-			//Ptrace is not pretty... and it requires that you do all ptrace calls from the same thread
-			runtime.LockOSThread()
+drain:
+	for {
+		select {
+		case e := <-eventChan:
+			ptReport.SyscallCount++
+			logger.Tracef("event (drained) ==> {pid=%v cn=%d}", e.pid, e.callNum)
+			syscallStats[e.callNum]++
 
-			logger.Debugf("target PID ==> %d", targetPid)
+		default:
+			logger.Trace("event draining is finished")
+			break drain
+		}
+	}
 
-			var wstat unix.WaitStatus
+	logger.Debugf("executed syscall count = %d", ptReport.SyscallCount)
+	logger.Debugf("number of syscalls: %v", len(syscallStats))
+	for scNum, scCount := range syscallStats {
+		logger.Tracef("%v", syscallResolver(scNum))
+		logger.Tracef("[%v] %v = %v", scNum, syscallResolver(scNum), scCount)
+		ptReport.SyscallStats[strconv.FormatInt(int64(scNum), 10)] = report.SyscallStatInfo{
+			Number: scNum,
+			Name:   syscallResolver(scNum),
+			Count:  scCount,
+		}
+	}
 
-			pid, err := unix.Wait4(targetPid, &wstat, 0, nil)
+	ptReport.SyscallNum = uint32(len(ptReport.SyscallStats))
+
+	m.status.report = ptReport
+	close(collectorDoneChan)
+	close(m.doneCh)
+}
+
+func (m *monitor) runPTrace(eventChan chan syscallEvent, collectorDoneChan chan int, targetPid int, ptReport *report.PtMonitorReport) {
+
+	archName := system.ArchName(ptReport.ArchName)
+	syscallResolver := system.CallNumberResolver(archName)
+
+	logger := log.WithField("op", "sensor.pt.monitor.ptrace")
+	logger.Debug("call")
+	defer logger.Debug("exit")
+
+	logger.Debugf("target PID ==> %d", targetPid)
+
+	var wstat unix.WaitStatus
+
+	pid, err := unix.Wait4(targetPid, &wstat, 0, nil)
+	if err != nil {
+		logger.Warnf("unix.Wait4 - error waiting for %d: %v", targetPid, err)
+		err := errors.SE("sensor.pt.monitor.wait4", "call.error", err)
+		m.appErrChan <- err
+		m.status.err = err
+		collectorDoneChan <- 2
+		return
+	}
+	if pid != targetPid {
+		logger.Tracef("wait4 returned new pid(%d), expected(%d)", pid, targetPid)
+	}
+
+	err = syscall.PtraceSetOptions(targetPid, ptOptions)
+	if err != nil {
+		log.Warnf("ptmon: collector - error setting trace options %d: %v", targetPid, err)
+		err := errors.SE("sensor.pt.monitor.ptsetoptions", "call.error", err)
+		m.appErrChan <- err
+		m.status.err = err
+		collectorDoneChan <- 3
+		return
+	}
+
+	logger.Debugf("initial process status = %v (pid=%d)", wstat, pid)
+
+	var procState map[int]*ptraceState = make(map[int]*ptraceState)
+
+	procState[targetPid] = &ptraceState{}
+ptrace:
+	for {
+		var childState *ptraceState
+		if state, ok := procState[pid]; !ok {
+			procState[pid] = &ptraceState{}
+			childState = procState[pid]
+		} else {
+			childState = state
+		}
+
+		var childExited = false
+		var childSig = int(0) // not injecting a signal by default.
+		switch {
+		case wstat.Exited():
+			var rc int = 0
+			if pid == targetPid {
+				if !childState.exiting {
+					logger.Warn("app exited (unexpected)")
+					rc = 4
+				} else {
+					rc = 0
+				}
+				if m.runOpt.ReportOnMainPidExit {
+					collectorDoneChan <- rc
+					logger.Tracef("[pid %d] main process exited, stopping tracing", targetPid)
+					break ptrace
+				}
+			} else {
+				logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
+				delete(procState, pid)
+			}
+			childExited = true
+
+		case wstat.Signaled():
+			if pid == targetPid {
+				logger.Debugf("[pid %d] main process unexpectedly terminated by a signal, stopping tracing", targetPid)
+				err := errors.SE("sensor.pt.monitor.ptrace", "ptstate.error", fmt.Errorf("main process unexpectedly terminated by a signal"))
+				m.appErrChan <- err
+				m.status.err = err
+				collectorDoneChan <- 5
+				break ptrace
+			}
+			logger.Warnf("[pid %d]  - signalled (unexpected)", pid)
+			childExited = true // don't call PtraceSyscall
+
+		case wstat.Continued():
+			logger.Tracef("[pid %d] - continued", pid)
+
+		case wstat.Stopped():
+
+			var stopType string
+			stopSig := wstat.StopSignal()
+
+			switch stopSig {
+
+			case SIGPTRAP:
+				stopType = "syscall_stop"
+
+			case syscall.SIGTRAP:
+				switch trapCause := wstat.TrapCause(); trapCause {
+				case syscall.PTRACE_EVENT_CLONE,
+					syscall.PTRACE_EVENT_FORK,
+					syscall.PTRACE_EVENT_VFORK,
+					syscall.PTRACE_EVENT_EXEC:
+
+					stopType = "ptrace_event_stop"
+					if newPID, err := syscall.PtraceGetEventMsg(targetPid); err != nil {
+						logger.Debugf("[pid %d] received '%s' event, failed to get the pid of the new process: %s", pid, ptraceEventEnum(trapCause), err)
+					} else {
+						procState[int(newPID)] = &ptraceState{}
+						logger.Tracef("[pid %d] ptrace stop occurred (%s), event pid = %d, syscall => %s, continue...", pid, ptraceEventEnum(trapCause), newPID, childState.callName)
+					}
+
+				case syscall.PTRACE_EVENT_EXIT:
+					stopType = "ptrace_event_stop"
+					childState.exiting = true
+					// setting this to true, to count unfinished syscalls
+					// e.g. `exit_group`, which will no longer reach `stopped` state
+					// after this event, then next stop after wait4 will SIGTRAP with status exited
+					childState.gotRetVal = true
+					if logger.Logger.IsLevelEnabled(log.TraceLevel) {
+						exitCode, err := syscall.PtraceGetEventMsg(pid)
+						if err != nil {
+							logger.Tracef("[pid %d] reported exit, failed to get exit code : %s", pid, err)
+						} else {
+							logger.Tracef("[pid %d] PTRACE_EVENT_EXIT, exit status value: %d", pid, exitCode)
+						}
+					}
+
+				case syscall.PTRACE_EVENT_SECCOMP:
+					stopType = "seccomp_stop"
+				default:
+					logger.Tracef("unknown ptrace event stop (%d)...", trapCause)
+					stopType = fmt.Sprintf("ptrace_%d_event", trapCause)
+				}
+			// these signals follow FORK for child processes, etc if ptracing clone, fork, etc
+			case syscall.SIGSTOP,
+				syscall.SIGTSTP,
+				syscall.SIGTTIN,
+				syscall.SIGTTOU:
+				// these are to be ignored. this is not a debugger.
+				stopType = "group_stop"
+			default:
+				// a signal that likely has to be injected back to the traced process
+				// theoretically, signal forwarder will not see this, as it's sent to a process of the tracee
+				// whereas signal forwarder sees only the signals delivered to the sensor's main process
+				stopType = "signal_stop"
+			}
+
+			logger.Tracef(
+				"[pid %d] stopSig=> %s, stop type => %v, syscallReturn(%v)",
+				pid,
+				stopSignalInfo(stopSig),
+				stopType,
+				childState.expectReturn)
+
+			if stopType != "syscall_stop" {
+
+				if stopType == "signal_stop" {
+					childSig = int(stopSig)
+					logger.Tracef("[pid %d] injecting signal(%d) with the next PtraceSyscall...", pid, childSig)
+				}
+
+				logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
+			} else {
+				var regs unix.PtraceRegs
+
+				if err := unix.PtraceGetRegs(pid, &regs); err != nil {
+					logger.Fatalf("[pid %d] unix.PtraceGetRegs(call): %v", pid, err)
+				}
+
+				switch childState.expectReturn {
+				case false:
+
+					childState.callNum = system.CallNumber(regs)
+					childState.callName = syscallResolver(uint32(childState.callNum))
+					childState.expectReturn = true
+					childState.gotCallNum = true
+
+					logger.Tracef("[pid %d] %s( <unfinished...> : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+				case true:
+
+					childState.retVal = system.CallReturnValue(regs)
+					childState.expectReturn = false
+					childState.gotRetVal = true
+
+					logger.Tracef("[pid %d] <... %s resumed>) = %d : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, childState.retVal, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
+				}
+
+			}
+		default:
+			logger.Debugf(
+				"[pid %d] wait4 returned unexpected state: %d, stopped, continued, signalled, exited checked",
+				pid,
+				wstat,
+			)
+		}
+
+		if childState.gotCallNum && childState.gotRetVal {
+			//TODO: need to figure out what to do with unpaired syscalls
+			// see above (e.g. ptrace_stops)
+			// this should go away(?) if tracking all new process creation calls
+			// these should be captured in under their own trap's (SIGTRAP sig) cause
+			childState.gotCallNum = false
+			childState.gotRetVal = false
+
+			select {
+			case eventChan <- syscallEvent{
+				pid:     pid,
+				callNum: uint32(childState.callNum),
+				retVal:  childState.retVal,
+			}:
+			case <-m.ctx.Done():
+				logger.Info("stopping...")
+				return
+			}
+		}
+
+		// continue execution
+		if !childExited {
+			err = unix.PtraceSyscall(pid, childSig)
 			if err != nil {
-				logger.Warnf("unix.Wait4 - error waiting for %d: %v", targetPid, err)
+				// the process could've been killed, which is normal
+				if err.(syscall.Errno) != syscall.ESRCH {
+					logger.Errorf("[pid %d] trace syscall p sig=%v error - %v (errno=%d)", pid, childSig, err, err.(syscall.Errno))
+					m.appErrChan <- errors.SE("sensor.pt.monitor.ptsyscall", "call.error", err)
+				} else {
+					logger.Debugf("[pid %d] PtraceSyscall returned ESRCH ignoring (most likely killed)", pid)
+				}
+			}
+		}
+
+		// wait for any child process to accommodate clones, forks, etc.
+		pid, err = unix.Wait4(-1, &wstat, syscall.WALL, nil)
+		if err != nil {
+			if err.(syscall.Errno) == syscall.ECHILD {
+				logger.Debugf("[pid %d] wait4 returned ECHILD error, there nothing more to collect, ...", pid)
+				if !procState[targetPid].exiting {
+					logger.Debugf("[pid %d] has no children to track and but is not in 'exiting' state", targetPid)
+					collectorDoneChan <- 4 // failed main app
+					return
+				}
+				break ptrace
+			} else {
+				logger.Debugf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
+				m.appErrChan <- errors.SE("sensor.pt.monitor.wait4", "call.error", err)
+				m.status.err = err
 				collectorDoneChan <- 2
 				return
 			}
-			if pid != targetPid {
-				logger.Tracef("wait4 returned new pid(%d), expected(%d)", pid, targetPid)
-			}
-
-			err = syscall.PtraceSetOptions(targetPid, ptOptions)
-			if err != nil {
-				log.Warnf("ptmon: collector - error setting trace options %d: %v", targetPid, err)
-				collectorDoneChan <- 3
-				return
-			}
-
-			logger.Debugf("initial process status = %v (pid=%d)", wstat, pid)
-
-			var procState map[int]*ptraceState = make(map[int]*ptraceState)
-
-			procState[targetPid] = &ptraceState{}
-		ptrace:
-			for {
-				var childState *ptraceState
-				if state, ok := procState[pid]; !ok {
-					procState[pid] = &ptraceState{}
-					childState = procState[pid]
-				} else {
-					childState = state
-				}
-
-				var childExited = false
-				var childSig = int(0) // not injecting a signal by default.
-				switch {
-				case wstat.Exited():
-					var rc int = 0
-					if pid == targetPid {
-						if !childState.exiting {
-							logger.Warn("app exited (unexpected)")
-							rc = 4
-						} else {
-							rc = 0
-						}
-						if m.runOpt.ReportOnMainPidExit {
-							collectorDoneChan <- rc
-							logger.Tracef("[pid %d] main process exited, stopping tracing", targetPid)
-							break ptrace
-						}
-					} else {
-						logger.Tracef("[pid %d] - exited, status: %d", pid, wstat.ExitStatus())
-						delete(procState, pid)
-					}
-					childExited = true
-
-				case wstat.Signaled():
-					if pid == targetPid {
-						logger.Debugf("[pid %d] main process unexpectedly terminated by a signal, stopping tracing", targetPid)
-						collectorDoneChan <- 5
-						break ptrace
-					}
-					logger.Warnf("[pid %d]  - signalled (unexpected)", pid)
-					childExited = true
-
-				case wstat.Continued():
-					logger.Tracef("[pid %d] - continued", pid)
-
-				case wstat.Stopped():
-
-					var stopType string
-					stopSig := wstat.StopSignal()
-
-					switch stopSig {
-
-					case SIGPTRAP:
-						stopType = "syscall_stop"
-
-					case syscall.SIGTRAP:
-						switch trapCause := wstat.TrapCause(); trapCause {
-						case syscall.PTRACE_EVENT_CLONE,
-							syscall.PTRACE_EVENT_FORK,
-							syscall.PTRACE_EVENT_VFORK,
-							syscall.PTRACE_EVENT_EXEC:
-
-							stopType = "ptrace_event_stop"
-							if newPID, err := syscall.PtraceGetEventMsg(targetPid); err != nil {
-								logger.Debugf("[pid %d] received '%s' event, failed to get the pid of the new process: %s", pid, ptraceEventEnum(trapCause), err)
-							} else {
-								procState[int(newPID)] = &ptraceState{}
-								logger.Tracef("[pid %d] ptrace stop occurred (%s), event pid = %d, syscall => %s, continue...", pid, ptraceEventEnum(trapCause), newPID, childState.callName)
-							}
-
-						case syscall.PTRACE_EVENT_EXIT:
-							stopType = "ptrace_event_stop"
-							childState.exiting = true
-							// setting this to true, to count unfinished syscalls
-							// e.g. `exit_group`, which will no longer reach `stopped` state
-							// after this event, then next stop after wait4 will SIGTRAP with status exited
-							childState.gotRetVal = true
-							if logger.Logger.IsLevelEnabled(log.TraceLevel) {
-								exitCode, err := syscall.PtraceGetEventMsg(pid)
-								if err != nil {
-									logger.Tracef("[pid %d] reported exit, failed to get exit code : %s", pid, err)
-								} else {
-									logger.Tracef("[pid %d] PTRACE_EVENT_EXIT, exit status value: %d", pid, exitCode)
-								}
-							}
-
-						case syscall.PTRACE_EVENT_SECCOMP:
-							stopType = "seccomp_stop"
-						default:
-							logger.Tracef("unknown ptrace event stop (%d)...", trapCause)
-							stopType = fmt.Sprintf("ptrace_%d_event", trapCause)
-						}
-					// these signals follow FORK for child processes, etc if ptracing clone, fork, etc
-					case syscall.SIGSTOP,
-						syscall.SIGTSTP,
-						syscall.SIGTTIN,
-						syscall.SIGTTOU:
-						// these are to be ignored. this is not a debugger.
-						stopType = "group_stop"
-					default:
-						// a signal that likely has to be injected back to the traced process
-						// theoretically, signal forwarder will not see this, as it's sent to a process of the tracee
-						// whereas signal forwarder sees only the signals delivered to the sensor's main process
-						stopType = "signal_stop"
-					}
-
-					logger.Tracef(
-						"[pid %d] stopSig=> %s, stop type => %v, syscallReturn(%v)",
-						pid,
-						stopSignalInfo(stopSig),
-						stopType,
-						childState.expectReturn)
-
-					if stopType != "syscall_stop" {
-
-						if stopType == "signal_stop" {
-							childSig = int(stopSig)
-							logger.Tracef("[pid %d] injecting signal(%d) with the next PtraceSyscall...", pid, childSig)
-						}
-
-						logger.Tracef("non syscall stop, returning control to pid (%d), sig(%d)...", pid, childSig)
-					} else {
-						var regs unix.PtraceRegs
-
-						if err := unix.PtraceGetRegs(pid, &regs); err != nil {
-							logger.Fatalf("[pid %d] unix.PtraceGetRegs(call): %v", pid, err)
-						}
-
-						switch childState.expectReturn {
-						case false:
-
-							childState.callNum = system.CallNumber(regs)
-							childState.callName = syscallResolver(uint32(childState.callNum))
-							childState.expectReturn = true
-							childState.gotCallNum = true
-
-							logger.Tracef("[pid %d] %s( <unfinished...> : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
-						case true:
-
-							childState.retVal = system.CallReturnValue(regs)
-							childState.expectReturn = false
-							childState.gotRetVal = true
-
-							logger.Tracef("[pid %d] <... %s resumed>) = %d : orig_r2=%d, r0=%d, r1=%d, r2=%d ", pid, childState.callName, childState.retVal, regs.Orig_gpr2, regs.Gprs[0], regs.Gprs[1], regs.Gprs[2])
-						}
-
-					}
-				default:
-					logger.Debugf(
-						"[pid %d] wait4 returned unexpected state: %d, stopped, continued, signalled, exited checked",
-						pid,
-						wstat,
-					)
-				}
-
-				if childState.gotCallNum && childState.gotRetVal {
-					//TODO: need to figure out what to do with unpaired syscalls
-					// see above (e.g. ptrace_stops)
-					// this should go away(?) if tracking all new process creation calls
-					// these should be captured in under their own trap's (SIGTRAP sig) cause
-					childState.gotCallNum = false
-					childState.gotRetVal = false
-
-					select {
-					case eventChan <- syscallEvent{
-						pid:     pid,
-						callNum: uint32(childState.callNum),
-						retVal:  childState.retVal,
-					}:
-					case <-m.ctx.Done():
-						logger.Info("stopping...")
-						return
-					}
-				}
-
-				// continue execution
-				if !childExited {
-					err = unix.PtraceSyscall(pid, childSig)
-					if err != nil {
-						// the process could've been killed, which is normal
-						if err.(syscall.Errno) != syscall.ESRCH {
-							logger.Errorf("[pid %d] trace syscall p sig=%v error - %v (errno=%d)", pid, childSig, err, err.(syscall.Errno))
-							m.appErrChan <- errors.SE("ptrace.App.collect.ptsyscall", "call.error", err)
-						} else {
-							logger.Debugf("[pid %d] PtraceSyscall returned ESRCH ignoring (most likely killed)", pid)
-						}
-					}
-				}
-
-				// wait for any child process to accommodate clones, forks, etc.
-				pid, err = unix.Wait4(-1, &wstat, syscall.WALL, nil)
-				if err != nil {
-					if err.(syscall.Errno) == syscall.ECHILD {
-						logger.Debugf("[pid %d] wait4 returned ECHILD error, there nothing more to collect, ...", pid)
-						if !procState[targetPid].exiting {
-							logger.Debugf("[pid %d] has no children to track and but is not in 'exiting' state", targetPid)
-							collectorDoneChan <- 4 // failed main app
-							return
-						}
-						break ptrace
-					} else {
-						logger.Debugf("unix.Wait4 - error waiting 4 %d: %v", pid, err)
-						m.appErrChan <- errors.SE("ptrace.App.collect.wait4", "call.error", err)
-						collectorDoneChan <- 2
-						return
-					}
-				}
-				if pid != targetPid {
-					logger.Tracef("wait4 returned a child pid(%d) of pid(%d)", pid, targetPid)
-				}
-
-			}
-
-			logger.Infof("exiting... status=%v", wstat)
-			collectorDoneChan <- 0
-		}()
-
-	done:
-		for {
-			select {
-			case rc := <-collectorDoneChan:
-				logger.Info("collector finished =>", rc)
-				break done
-			case <-m.ctx.Done():
-				logger.Info("stopping...")
-
-				break done
-			case e := <-eventChan:
-				ptReport.SyscallCount++
-				//logger.Tracef("syscall ==> %d (%s)", e.callNum, syscallResolver(e.callNum))
-
-				syscallStats[e.callNum]++
-			}
+		}
+		if pid != targetPid {
+			logger.Tracef("wait4 returned a child pid(%d) of pid(%d)", pid, targetPid)
 		}
 
-	drain:
-		for {
-			select {
-			case e := <-eventChan:
-				ptReport.SyscallCount++
-				logger.Tracef("event (drained) ==> {pid=%v cn=%d}", e.pid, e.callNum)
-				syscallStats[e.callNum]++
+	}
 
-			default:
-				logger.Trace("event draining is finished")
-				break drain
-			}
-		}
-
-		logger.Debugf("executed syscall count = %d", ptReport.SyscallCount)
-		logger.Debugf("number of syscalls: %v", len(syscallStats))
-		for scNum, scCount := range syscallStats {
-			logger.Tracef("%v", syscallResolver(scNum))
-			logger.Tracef("[%v] %v = %v", scNum, syscallResolver(scNum), scCount)
-			ptReport.SyscallStats[strconv.FormatInt(int64(scNum), 10)] = report.SyscallStatInfo{
-				Number: scNum,
-				Name:   syscallResolver(scNum),
-				Count:  scCount,
-			}
-		}
-
-		ptReport.SyscallNum = uint32(len(ptReport.SyscallStats))
-
-		m.status.report = ptReport
-		close(m.doneCh)
-	}()
+	logger.Infof("exiting... status=%v", wstat)
+	collectorDoneChan <- 0
 
 }
 
@@ -574,11 +621,7 @@ func startSignalForwarding(
 
 			case s := <-signalCh:
 
-				var reportSignal = true
-				if s == syscall.SIGCHLD && log.IsLevelEnabled(log.TraceLevel) {
-					reportSignal = false
-				}
-				if reportSignal {
+				if !(s == syscall.SIGCHLD && log.IsLevelEnabled(log.TraceLevel)) {
 					log.WithField("signal", s).Debug("ptmon: signal forwarder - received signal")
 				}
 
